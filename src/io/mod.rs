@@ -42,9 +42,13 @@ pub struct GenericGaussianPointCloud {
     pub center: Point3<f32>,
     pub aabb: Aabb<f32>,
 
-    // 2DGS texture data
-    pub residual_textures: Option<Vec<u8>>,
-    pub residual_dim: u32,
+    // 2DGS atlas texture data
+    pub atlas_texture: Option<Vec<u8>>,   // [H, W, C] FP16 data
+    pub atlas_rects: Option<Vec<f32>>,    // [N, 4] as flat f32: (u0_px, v0_px, w_px, h_px)
+    pub atlas_width: u32,
+    pub atlas_height: u32,
+    pub atlas_channels: u32,
+    pub uv_extent: f32,
     pub kernel_type: u32,
 }
 
@@ -109,8 +113,12 @@ impl GenericGaussianPointCloud {
             aabb: bbox,
             compressed: false,
             is_2dgs: false,
-            residual_textures: None,
-            residual_dim: 0,
+            atlas_texture: None,
+            atlas_rects: None,
+            atlas_width: 0,
+            atlas_height: 0,
+            atlas_channels: 0,
+            uv_extent: 4.0,
             kernel_type: 0,
         }
     }
@@ -156,8 +164,12 @@ impl GenericGaussianPointCloud {
             aabb: bbox,
             compressed: false,
             is_2dgs: true,
-            residual_textures: None,
-            residual_dim: 0,
+            atlas_texture: None,
+            atlas_rects: None,
+            atlas_width: 0,
+            atlas_height: 0,
+            atlas_channels: 0,
+            uv_extent: 4.0,
             kernel_type: 0,
         }
     }
@@ -205,8 +217,12 @@ impl GenericGaussianPointCloud {
             aabb: bbox,
             compressed: true,
             is_2dgs: false,
-            residual_textures: None,
-            residual_dim: 0,
+            atlas_texture: None,
+            atlas_rects: None,
+            atlas_width: 0,
+            atlas_height: 0,
+            atlas_channels: 0,
+            uv_extent: 4.0,
             kernel_type: 0,
         }
     }
@@ -241,47 +257,58 @@ impl GenericGaussianPointCloud {
 }
 
 impl GenericGaussianPointCloud {
-    /// Load residual textures from a binary file.
-    /// Format: [magic: 4 bytes "NTEX"] [num_points: u32] [grid_size: u32] [residual_dim: u32] [kernel_type: u32] [data: FP16]
-    pub fn load_textures_from_file(&mut self, path: &Path) -> anyhow::Result<()> {
+    /// Load atlas textures from a NATL binary file.
+    /// Format: [magic "NATL" 4B] [W: u32] [H: u32] [C: u32] [kernel_type: u32]
+    ///         [N: u32] [uv_extent: f32] [pad: u32]
+    ///         [rects: N*4 f32] [atlas: H*W*C FP16]
+    pub fn load_atlas_from_file(&mut self, path: &Path) -> anyhow::Result<()> {
         use std::io::Read as _;
         let mut file = std::fs::File::open(path)?;
         let mut magic = [0u8; 4];
         file.read_exact(&mut magic)?;
-        if &magic != b"NTEX" {
-            return Err(anyhow::anyhow!("Invalid texture file magic bytes"));
+        if &magic != b"NATL" {
+            return Err(anyhow::anyhow!("Invalid atlas file magic (expected NATL)"));
         }
-        let mut header = [0u8; 16];
+        let mut header = [0u8; 28]; // 7 × u32
         file.read_exact(&mut header)?;
-        let num_points = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
-        let grid_size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
-        let residual_dim = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
+        let w = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        let h = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+        let c = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
         let kernel_type = u32::from_le_bytes([header[12], header[13], header[14], header[15]]);
+        let n = u32::from_le_bytes([header[16], header[17], header[18], header[19]]) as usize;
+        let uv_extent = f32::from_le_bytes([header[20], header[21], header[22], header[23]]);
+        // header[24..28] is padding
 
-        if num_points != self.num_points {
+        if n != self.num_points {
             return Err(anyhow::anyhow!(
-                "Texture file has {} points but PLY has {}",
-                num_points,
-                self.num_points
+                "Atlas has {} rects but PLY has {} points",
+                n, self.num_points
             ));
         }
 
-        let data_size = num_points * grid_size * grid_size * residual_dim as usize * 2; // FP16
-        let mut data = vec![0u8; data_size];
-        file.read_exact(&mut data)?;
+        // Read rects: N * 4 * 4 bytes (f32)
+        let rects_size = n * 4 * 4;
+        let mut rects_bytes = vec![0u8; rects_size];
+        file.read_exact(&mut rects_bytes)?;
+        let rects: Vec<f32> = bytemuck::cast_slice(&rects_bytes).to_vec();
+
+        // Read atlas: H * W * C * 2 bytes (FP16)
+        let atlas_size = h as usize * w as usize * c as usize * 2;
+        let mut atlas_data = vec![0u8; atlas_size];
+        file.read_exact(&mut atlas_data)?;
 
         log::info!(
-            "loaded {} textures: {}x{} grid, {}D residuals, kernel_type={} ({:.1} MB)",
-            num_points,
-            grid_size,
-            grid_size,
-            residual_dim,
-            kernel_type,
-            data_size as f64 / 1e6
+            "loaded atlas {}x{}x{}, {} rects, kernel_type={}, uv_extent={} ({:.1} MB)",
+            w, h, c, n, kernel_type, uv_extent,
+            (rects_size + atlas_size) as f64 / 1e6
         );
 
-        self.residual_textures = Some(data);
-        self.residual_dim = residual_dim;
+        self.atlas_texture = Some(atlas_data);
+        self.atlas_rects = Some(rects);
+        self.atlas_width = w;
+        self.atlas_height = h;
+        self.atlas_channels = c;
+        self.uv_extent = uv_extent;
         self.kernel_type = kernel_type;
         Ok(())
     }

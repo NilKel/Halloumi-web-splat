@@ -1,27 +1,7 @@
 // 2DGS Surfel Rendering Shader
-// Ray-disk intersection + hybrid kernel + texture residual lookup
+// Ray-disk intersection + kernel evaluation + atlas texture lookup
 
 const FilterInvSquare: f32 = 2.0;  // 1 / (FilterSize^2) where FilterSize = sqrt(0.5)
-
-// SH constants for 48D residual evaluation
-const SH_C0: f32 = 0.28209479177387814;
-const SH_C1: f32 = 0.4886025119029199;
-const SH_C2 = array<f32,5>(
-    1.0925484305920792,
-    -1.0925484305920792,
-    0.31539156525252005,
-    -1.0925484305920792,
-    0.5462742152960396
-);
-const SH_C3 = array<f32,7>(
-    -0.5900435899266435,
-    2.890611442640554,
-    -0.4570457994644658,
-    0.3731763325901154,
-    -0.4570457994644658,
-    1.445305721320277,
-    -0.5900435899266435
-);
 
 // Splat2DGS: 40 bytes (10 u32s)
 struct Splat2DGS {
@@ -54,10 +34,10 @@ struct CameraUniforms {
 };
 
 struct TexParams {
-    residual_dim: u32,      // 3 or 48
+    atlas_width: u32,
+    atlas_height: u32,
     kernel_type: u32,       // 0=Gaussian, 1=Beta, 2=Flex, 3=General, 4=BetaScaled
-    _pad1: u32,
-    _pad2: u32,
+    uv_extent_bits: u32,    // f32 reinterpreted as u32
 };
 
 struct VertexOutput {
@@ -73,7 +53,7 @@ struct VertexOutput {
     @location(8) @interpolate(flat) shape: f32,
 };
 
-// Group 0: Point cloud render data (splats + surfels)
+// Group 0: Point cloud render data (splats)
 @group(0) @binding(2)
 var<storage, read> splats_2d: array<Splat2DGS>;
 
@@ -85,18 +65,16 @@ var<storage, read> indices: array<u32>;
 @group(2) @binding(0)
 var<storage, read> surfels: array<Surfel>;
 
-// Group 3: Textures + camera + params
+// Group 3: Atlas + camera + params
 @group(3) @binding(0)
-var<storage, read> textures: array<u32>;  // FP16 data packed as u32 pairs
+var<storage, read> atlas_texture: array<u32>;  // [H, W, 3] FP16 packed as u32
 @group(3) @binding(1)
-var<uniform> camera: CameraUniforms;
+var<storage, read> atlas_rects: array<f32>;    // [N, 4] flat: (u0_px, v0_px, w_px, h_px)
 @group(3) @binding(2)
+var<uniform> camera: CameraUniforms;
+@group(3) @binding(3)
 var<uniform> tex_params: TexParams;
 
-
-fn unpack_f16(packed: u32, idx: u32) -> f32 {
-    return unpack2x16float(packed)[idx];
-}
 
 @vertex
 fn vs_main(
@@ -123,13 +101,13 @@ fn vs_main(
     let v_center = unpack2x16float(splat.pos);
     let v_extent = unpack2x16float(splat.extent);
 
-    // Unpack base color
+    // Unpack base color + shape
     let rg = unpack2x16float(splat.color_rg);
     let b_shape = unpack2x16float(splat.color_b_shape);
     out.base_color = vec3<f32>(rg.x, rg.y, b_shape.x);
     out.shape = b_shape.y;
 
-    // Gaussian ID and position (for texture lookup / viewdir)
+    // Gaussian ID and position
     out.gauss_id = splat.gauss_id;
     let surfel = surfels[splat.gauss_id];
     out.gauss_xyz = vec3<f32>(surfel.x, surfel.y, surfel.z);
@@ -142,7 +120,6 @@ fn vs_main(
     let x = f32(in_vertex_index % 2u == 0u) * 2.0 - 1.0;
     let y = f32(in_vertex_index < 2u) * 2.0 - 1.0;
 
-    // The extent is already in NDC units, scale by a generous margin
     let margin = 1.2;
     let offset = vec2<f32>(x, y) * v_extent * margin;
     out.position = vec4<f32>(v_center + offset, 0.0, 1.0);
@@ -152,14 +129,13 @@ fn vs_main(
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    // Fragment position in pixel coordinates
     let pix = in.position.xy;
 
     let Tu = in.Tu;
     let Tv = in.Tv;
     let Tw = in.Tw;
 
-    // Ray-disk intersection: solve for (s.x, s.y) on the surfel disk
+    // Ray-disk intersection
     let k = vec3<f32>(pix.x * Tw.x - Tu.x, pix.x * Tw.y - Tu.y, pix.x * Tw.z - Tu.z);
     let l = vec3<f32>(pix.y * Tw.x - Tv.x, pix.y * Tw.y - Tv.y, pix.y * Tw.z - Tv.z);
     let p = cross(k, l);
@@ -170,20 +146,19 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     let s = vec2<f32>(p.x / p.z, p.y / p.z);
 
-    // Compute rho3d (surfel distance) and rho2d (screen-space low-pass)
+    // Compute rho3d and rho2d
     let rho3d = dot(s, s);
     let d = in.center_pix - pix;
     let rho2d = FilterInvSquare * dot(d, d);
     let rho = min(rho3d, rho2d);
 
+    // Kernel evaluation
     let opa = in.opacity;
     let kernel_type = tex_params.kernel_type;
     let shape_val = in.shape;
     var alpha: f32;
 
     if (kernel_type == 1u || kernel_type == 4u) {
-        // Beta kernel: (1 - rho3d/k²)^shape, with Gaussian low-pass handoff
-        // kernel_type 1: k²=1 (unit disk), kernel_type 4: k²=9 (3σ scaled)
         let k_sq = select(1.0, 9.0, kernel_type == 4u);
         if rho3d >= k_sq + 1e-6 {
             discard;
@@ -191,32 +166,22 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let base = max(0.0, 1.0 - rho3d / k_sq);
         let alpha_beta = pow(base, shape_val);
         let alpha_lp = exp(-rho2d / 2.0);
-        let kernel_val = max(alpha_beta, alpha_lp);
-        alpha = min(0.99, opa * kernel_val);
+        alpha = min(0.99, opa * max(alpha_beta, alpha_lp));
     } else if kernel_type == 2u {
-        // Flex kernel: modified Gaussian with per-Gaussian beta
         let power = -0.5 * rho;
-        if power > 0.0 {
-            discard;
-        }
+        if power > 0.0 { discard; }
         var G = exp(power);
         if shape_val > 0.0 {
             G = (1.0 + shape_val) * G / (1.0 + shape_val * G);
         }
         alpha = min(0.99, opa * G);
     } else if kernel_type == 3u {
-        // General kernel: isotropic generalized Gaussian exp(-0.5 * rho^(beta/2))
         let power = -0.5 * pow(rho, shape_val * 0.5);
-        if power > 0.0 {
-            discard;
-        }
+        if power > 0.0 { discard; }
         alpha = min(0.99, opa * exp(power));
     } else {
-        // Default: standard Gaussian kernel (kernel_type 0)
         let power = -0.5 * rho;
-        if power > 0.0 {
-            discard;
-        }
+        if power > 0.0 { discard; }
         alpha = min(0.99, opa * exp(power));
     }
 
@@ -227,100 +192,48 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Start with SH base color
     var color = in.base_color;
 
-    // Texture residual lookup
-    let residual_dim = tex_params.residual_dim;
-    if residual_dim > 0u {
-        // Map surfel coords to texel coords: s ∈ [-4, 4] → texel ∈ [0, 8)
-        // Texel-center convention: sample i at (i+0.5)/8 * 8 - 4 = i + 0.5 - 4 = i - 3.5
-        // Inverse: texel = s + 3.5
-        let tex_u = clamp(s.x + 3.5, 0.0, 6.999);
-        let tex_v = clamp(s.y + 3.5, 0.0, 6.999);
-
-        let u0 = i32(tex_u);
-        let v0 = i32(tex_v);
-        let fu = tex_u - f32(u0);
-        let fv = tex_v - f32(v0);
-        let u1 = min(u0 + 1, 7);
-        let v1 = min(v0 + 1, 7);
-
-        // Bilinear weights
-        let w00 = (1.0 - fu) * (1.0 - fv);
-        let w10 = fu * (1.0 - fv);
-        let w01 = (1.0 - fu) * fv;
-        let w11 = fu * fv;
-
+    // Atlas texture lookup
+    let atlas_w = tex_params.atlas_width;
+    if atlas_w > 0u {
+        let E = bitcast<f32>(tex_params.uv_extent_bits);
         let gauss_id = in.gauss_id;
 
-        if residual_dim == 48u {
-            // 48D SH residual: per-texel SH coefficients, evaluate at viewdir
-            // Texture layout: [N, 8, 8, 48] as FP16, packed as u32 pairs
-            // Channel layout within 48D: [R×16, G×16, B×16]
-            let tex_stride = 8u * 8u * 48u;  // 3072 f16 values per Gaussian
-            let base = gauss_id * tex_stride; // in f16 units
+        // Read per-Gaussian rect from atlas_rects [N, 4]
+        let r_base = gauss_id * 4u;
+        let u0_px  = atlas_rects[r_base + 0u];
+        let v0_px  = atlas_rects[r_base + 1u];
+        let u_span = atlas_rects[r_base + 2u];
+        let v_span = atlas_rects[r_base + 3u];
 
-            // Compute view direction at Gaussian center
-            let cam_pos = camera.view_inv[3].xyz;
-            let dir = normalize(in.gauss_xyz - cam_pos);
+        // Surfel s -> atlas pixel coords (texel-center convention)
+        // Inverse: tex_coord = (s + E) / (2*E) * span - 0.5
+        let au = u0_px + (s.x + E) / (2.0 * E) * u_span - 0.5;
+        let av = v0_px + (s.y + E) / (2.0 * E) * v_span - 0.5;
+        let au_c = clamp(au, u0_px, u0_px + u_span - 1.001);
+        let av_c = clamp(av, v0_px, v0_px + v_span - 1.001);
 
-            // Precompute SH basis (degree 3, 16 terms)
-            let dx = dir.x; let dy = dir.y; let dz = dir.z;
-            let xx = dx*dx; let yy = dy*dy; let zz = dz*dz;
-            let xy = dx*dy; let yz = dy*dz; let xz = dx*dz;
+        let au0 = i32(au_c);
+        let av0 = i32(av_c);
+        let fu = au_c - f32(au0);
+        let fv = av_c - f32(av0);
+        let au1 = min(au0 + 1, i32(u0_px + u_span - 1.0));
+        let av1 = min(av0 + 1, i32(v0_px + v_span - 1.0));
 
-            var sh_basis: array<f32, 16>;
-            sh_basis[0]  = SH_C0;
-            sh_basis[1]  = -SH_C1 * dy;
-            sh_basis[2]  = SH_C1 * dz;
-            sh_basis[3]  = -SH_C1 * dx;
-            sh_basis[4]  = SH_C2[0] * xy;
-            sh_basis[5]  = SH_C2[1] * yz;
-            sh_basis[6]  = SH_C2[2] * (2.0*zz - xx - yy);
-            sh_basis[7]  = SH_C2[3] * xz;
-            sh_basis[8]  = SH_C2[4] * (xx - yy);
-            sh_basis[9]  = SH_C3[0] * dy * (3.0*xx - yy);
-            sh_basis[10] = SH_C3[1] * xy * dz;
-            sh_basis[11] = SH_C3[2] * dy * (4.0*zz - xx - yy);
-            sh_basis[12] = SH_C3[3] * dz * (2.0*zz - 3.0*xx - 3.0*yy);
-            sh_basis[13] = SH_C3[4] * dx * (4.0*zz - xx - yy);
-            sh_basis[14] = SH_C3[5] * dz * (xx - yy);
-            sh_basis[15] = SH_C3[6] * dx * (xx - 3.0*yy);
-
-            // Texel offsets (in f16 units)
-            let off00 = base + u32(v0 * 8 + u0) * 48u;
-            let off10 = base + u32(v0 * 8 + u1) * 48u;
-            let off01 = base + u32(v1 * 8 + u0) * 48u;
-            let off11 = base + u32(v1 * 8 + u1) * 48u;
-
-            // Per-channel SH evaluation: channel layout is [R×16, G×16, B×16]
-            for (var ch = 0u; ch < 3u; ch++) {
-                let ch_off = ch * 16u;
-                var result = 0.0;
-                for (var k_sh = 0u; k_sh < 16u; k_sh++) {
-                    let f16_idx = ch_off + k_sh;
-                    // Read FP16 from packed u32 array
-                    let c00 = read_f16(off00 + f16_idx);
-                    let c10 = read_f16(off10 + f16_idx);
-                    let c01 = read_f16(off01 + f16_idx);
-                    let c11 = read_f16(off11 + f16_idx);
-
-                    let val = w00 * c00 + w10 * c10 + w01 * c01 + w11 * c11;
-                    result += sh_basis[k_sh] * val;
-                }
-                color[ch] += result;
-            }
-        } else if residual_dim == 3u {
-            // 3D DC residual: direct RGB addition
-            let tex_stride = 8u * 8u * 3u;  // 192 f16 values per Gaussian
-            let base = gauss_id * tex_stride;
-
-            for (var ch = 0u; ch < 3u; ch++) {
-                let c00 = read_f16(base + u32(v0 * 8 + u0) * 3u + ch);
-                let c10 = read_f16(base + u32(v0 * 8 + u1) * 3u + ch);
-                let c01 = read_f16(base + u32(v1 * 8 + u0) * 3u + ch);
-                let c11 = read_f16(base + u32(v1 * 8 + u1) * 3u + ch);
-
-                color[ch] += w00 * c00 + w10 * c10 + w01 * c01 + w11 * c11;
-            }
+        // Bilinear interpolation from atlas (3 channels, FP16 packed as u32)
+        // Atlas layout: [H, W, 3] as FP16 = [H, W, 3] f16 values
+        // Packed as u32: atlas_texture[idx] = pack2x16float(ch0, ch1)
+        // For 3 channels per pixel: 3 f16 = 1.5 u32 → 2 u32s per pixel (with 1 f16 waste)
+        // Actually stored as flat f16 array packed into u32: f16_index = (row * W + col) * 3 + ch
+        let aw = i32(atlas_w);
+        for (var ch = 0u; ch < 3u; ch++) {
+            let c00 = read_atlas_f16(av0, au0, ch, aw);
+            let c10 = read_atlas_f16(av0, au1, ch, aw);
+            let c01 = read_atlas_f16(av1, au0, ch, aw);
+            let c11 = read_atlas_f16(av1, au1, ch, aw);
+            color[ch] += (1.0 - fu) * (1.0 - fv) * c00
+                       + fu * (1.0 - fv) * c10
+                       + (1.0 - fu) * fv * c01
+                       + fu * fv * c11;
         }
     }
 
@@ -328,10 +241,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     return vec4<f32>(color, 1.0) * alpha;
 }
 
-// Read a single FP16 value from the packed u32 texture buffer
-// f16_index is the index in f16 units (not bytes, not u32s)
-fn read_f16(f16_index: u32) -> f32 {
+// Read a single FP16 value from the atlas texture buffer
+// Atlas is stored as flat [H * W * C] f16 values packed into u32 pairs
+fn read_atlas_f16(row: i32, col: i32, ch: u32, atlas_w: i32) -> f32 {
+    let f16_index = u32(row * atlas_w + col) * 3u + ch;
     let u32_index = f16_index / 2u;
     let component = f16_index % 2u;
-    return unpack2x16float(textures[u32_index])[component];
+    return unpack2x16float(atlas_texture[u32_index])[component];
 }

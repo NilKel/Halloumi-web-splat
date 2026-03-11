@@ -126,10 +126,13 @@ pub struct PointCloud {
     kernel_size: Option<f32>,
     background_color: Option<wgpu::Color>,
 
-    // 2DGS texture support
-    texture_buffer: Option<wgpu::Buffer>,
-    texture_bind_group: Option<wgpu::BindGroup>,
-    residual_dim: u32,
+    // 2DGS atlas texture support
+    atlas_buffer: Option<wgpu::Buffer>,       // [H, W, C] FP16 packed as u32
+    atlas_rects_buffer: Option<wgpu::Buffer>, // [N, 4] f32
+    atlas_width: u32,
+    atlas_height: u32,
+    atlas_channels: u32,
+    uv_extent: f32,
     kernel_type: u32,
     // Keep surfel buffer accessible for render shader (needs means3D for viewdir)
     surfel_buffer: Option<wgpu::Buffer>,
@@ -233,12 +236,11 @@ impl PointCloud {
             })
         };
 
-        // 2DGS: create texture buffer and surfel render bind group
-        let mut texture_buffer = None;
-        let mut texture_bind_group = None;
+        // 2DGS: create atlas + rects buffers and surfel render bind group
+        let mut atlas_buffer = None;
+        let mut atlas_rects_buffer = None;
         let mut surfel_buffer_opt = None;
         let mut surfel_render_bind_group = None;
-        let mut residual_dim = 0u32;
 
         if is_2dgs {
             // Surfel buffer for render pass (need means3D for viewdir)
@@ -258,23 +260,22 @@ impl PointCloud {
             }));
             surfel_buffer_opt = Some(surfel_buf);
 
-            // Texture buffer
-            if let Some(ref tex_data) = pc.residual_textures {
-                residual_dim = pc.residual_dim;
-                let tex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("residual textures buffer"),
-                    contents: tex_data,
+            // Atlas texture buffer
+            if let Some(ref atlas_data) = pc.atlas_texture {
+                atlas_buffer = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("atlas texture buffer"),
+                    contents: atlas_data,
                     usage: wgpu::BufferUsages::STORAGE,
-                });
-                texture_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("texture bind group"),
-                    layout: &Self::bind_group_layout_textures(device),
-                    entries: &[wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: tex_buf.as_entire_binding(),
-                    }],
                 }));
-                texture_buffer = Some(tex_buf);
+            }
+
+            // Atlas rects buffer
+            if let Some(ref rects) = pc.atlas_rects {
+                atlas_rects_buffer = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("atlas rects buffer"),
+                    contents: bytemuck::cast_slice(rects),
+                    usage: wgpu::BufferUsages::STORAGE,
+                }));
             }
         }
 
@@ -298,9 +299,12 @@ impl PointCloud {
                 b: c[2] as f64,
                 a: 1.,
             }),
-            texture_buffer,
-            texture_bind_group,
-            residual_dim,
+            atlas_buffer,
+            atlas_rects_buffer,
+            atlas_width: pc.atlas_width,
+            atlas_height: pc.atlas_height,
+            atlas_channels: pc.atlas_channels,
+            uv_extent: pc.uv_extent,
             kernel_type: pc.kernel_type,
             surfel_buffer: surfel_buffer_opt,
             surfel_render_bind_group,
@@ -458,22 +462,6 @@ impl PointCloud {
         })
     }
 
-    pub fn bind_group_layout_textures(device: &wgpu::Device) -> wgpu::BindGroupLayout {
-        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("texture bind group layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        })
-    }
-
     pub fn mip_splatting(&self) -> Option<bool> {
         self.mip_splatting
     }
@@ -493,20 +481,28 @@ impl PointCloud {
         self.is_2dgs
     }
 
-    pub fn residual_dim(&self) -> u32 {
-        self.residual_dim
-    }
-
     pub fn kernel_type(&self) -> u32 {
         self.kernel_type
     }
 
-    pub(crate) fn texture_bind_group(&self) -> Option<&wgpu::BindGroup> {
-        self.texture_bind_group.as_ref()
+    pub fn atlas_width(&self) -> u32 {
+        self.atlas_width
     }
 
-    pub(crate) fn texture_buffer(&self) -> Option<&wgpu::Buffer> {
-        self.texture_buffer.as_ref()
+    pub fn atlas_height(&self) -> u32 {
+        self.atlas_height
+    }
+
+    pub fn uv_extent(&self) -> f32 {
+        self.uv_extent
+    }
+
+    pub(crate) fn atlas_buffer(&self) -> Option<&wgpu::Buffer> {
+        self.atlas_buffer.as_ref()
+    }
+
+    pub(crate) fn atlas_rects_buffer(&self) -> Option<&wgpu::Buffer> {
+        self.atlas_rects_buffer.as_ref()
     }
 
     pub(crate) fn surfel_render_bind_group(&self) -> Option<&wgpu::BindGroup> {

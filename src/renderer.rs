@@ -18,19 +18,19 @@ use cgmath::{EuclideanSpace, Matrix4, Point3, SquareMatrix, Vector2, Vector4};
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct TexParamsUniform {
-    pub residual_dim: u32,
+    pub atlas_width: u32,
+    pub atlas_height: u32,
     pub kernel_type: u32,  // 0=Gaussian, 1=Beta, 2=Flex, 3=General, 4=BetaScaled
-    pub _pad1: u32,
-    pub _pad2: u32,
+    pub uv_extent_bits: u32, // f32 reinterpreted as u32 for uniform alignment
 }
 
 impl Default for TexParamsUniform {
     fn default() -> Self {
         Self {
-            residual_dim: 0,
+            atlas_width: 0,
+            atlas_height: 0,
             kernel_type: 0,
-            _pad1: 0,
-            _pad2: 0,
+            uv_extent_bits: 4.0f32.to_bits(),
         }
     }
 }
@@ -225,47 +225,64 @@ impl GaussianRenderer {
             let tp = UniformBuffer::new(
                 device,
                 TexParamsUniform {
-                    residual_dim: pc.map_or(0, |p| p.residual_dim()),
+                    atlas_width: pc.map_or(0, |p| p.atlas_width()),
+                    atlas_height: pc.map_or(0, |p| p.atlas_height()),
                     kernel_type: pc.map_or(0, |p| p.kernel_type()),
-                    ..Default::default()
+                    uv_extent_bits: pc.map_or(4.0f32, |p| p.uv_extent()).to_bits(),
                 },
                 Some("tex params uniform buffer"),
             );
 
             // Create the render bind group for group 3:
-            // binding 0: textures, binding 1: camera, binding 2: tex_params
+            // binding 0: atlas_texture, binding 1: atlas_rects, binding 2: camera, binding 3: tex_params
             let layout = Self::bind_group_layout_2dgs_render(device);
-            let mut entries = vec![
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: camera.buffer().as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: tp.buffer().as_entire_binding(),
-                },
-            ];
 
-            // Use real texture buffer from PointCloud if available, else dummy
-            let dummy_tex_buf;
-            let tex_resource = if let Some(buf) = pc.and_then(|p| p.texture_buffer()) {
+            // Atlas texture buffer (or dummy)
+            let dummy_atlas;
+            let atlas_resource = if let Some(buf) = pc.and_then(|p| p.atlas_buffer()) {
                 buf.as_entire_binding()
             } else {
-                dummy_tex_buf = device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("dummy texture buffer"),
+                dummy_atlas = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("dummy atlas buffer"),
                     size: 4,
                     usage: wgpu::BufferUsages::STORAGE,
                     mapped_at_creation: false,
                 });
-                dummy_tex_buf.as_entire_binding()
+                dummy_atlas.as_entire_binding()
             };
-            entries.insert(
-                0,
+
+            // Atlas rects buffer (or dummy)
+            let dummy_rects;
+            let rects_resource = if let Some(buf) = pc.and_then(|p| p.atlas_rects_buffer()) {
+                buf.as_entire_binding()
+            } else {
+                dummy_rects = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("dummy rects buffer"),
+                    size: 4,
+                    usage: wgpu::BufferUsages::STORAGE,
+                    mapped_at_creation: false,
+                });
+                dummy_rects.as_entire_binding()
+            };
+
+            let entries = [
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: tex_resource,
+                    resource: atlas_resource,
                 },
-            );
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: rects_resource,
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: camera.buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: tp.buffer().as_entire_binding(),
+                },
+            ];
 
             render_tex_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("2dgs render tex bind group"),
@@ -467,6 +484,7 @@ impl GaussianRenderer {
         device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("2dgs render bind group layout"),
             entries: &[
+                // binding 0: atlas texture (FP16 packed as u32)
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -477,8 +495,20 @@ impl GaussianRenderer {
                     },
                     count: None,
                 },
+                // binding 1: atlas rects [N, 4] f32
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // binding 2: camera uniforms
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
                     visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
@@ -487,8 +517,9 @@ impl GaussianRenderer {
                     },
                     count: None,
                 },
+                // binding 3: tex params (atlas dims, kernel_type, uv_extent)
                 wgpu::BindGroupLayoutEntry {
-                    binding: 2,
+                    binding: 3,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,

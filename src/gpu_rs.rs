@@ -70,7 +70,7 @@ impl GPURSSorter {
             log::warn!(
                 "Searching for the maximum subgroup size (wgpu currently does not allow to query subgroup sizes)"
             );
-            let sizes = vec![1, 8, 16, 32];
+            let sizes = vec![1, 8, 16];
             let mut cur_size = 2;
             enum State {
                 Init,
@@ -316,12 +316,15 @@ impl GPURSSorter {
         });
         self.record_sort(&bind_group, n, &mut encoder);
         let idx = queue.submit([encoder.finish()]);
-        device
+        let poll_result = device
             .poll(wgpu::PollType::Wait {
                 submission_index: Some(idx),
-                timeout: None,
-            })
-            .unwrap();
+                timeout: Some(std::time::Duration::from_secs(5)),
+            });
+        if poll_result.is_err() {
+            log::warn!("test_sort: GPU poll timed out or failed");
+            return false;
+        }
 
         let sorted = download_buffer::<f32>(&keyval_a, device, queue).await;
         for i in 0..n {

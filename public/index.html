@@ -179,6 +179,7 @@
         let params = new URLSearchParams(window.location.search);
         let scene_file = params.get("scene");
         let pc_file = params.get("file");
+        let atlas_file = params.get("atlas");
 
 
         function withProgress(response) {
@@ -228,10 +229,14 @@
                         }
                     }).then(r => r.arrayBuffer()).then(data => new Uint8Array(data))
                 }
+                var atlas_promise = Promise.resolve(null);
+                if (atlas_file) {
+                    atlas_promise = fetch(atlas_file).then(r => r.arrayBuffer()).then(data => new Uint8Array(data));
+                }
 
-                let [pc_data, scene_data] = await Promise.all([pc_promise, scene_promise]);
+                let [pc_data, scene_data, atlas_data] = await Promise.all([pc_promise, scene_promise, atlas_promise]);
                 await init_promise;
-                run_wasm(pc_data, scene_data, pc_file, scene_file);
+                run_wasm(pc_data, scene_data, pc_file, scene_file, atlas_data);
             } catch (e) {
                 document.getElementById("spinner").style.display = "none";
                 let errorPane = document.getElementById("loading-error");

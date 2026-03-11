@@ -68,6 +68,7 @@ async fn main() {
         Some(opt.input),
         opt.scene,
         opt.atlas,
+        None,
     )
     .await;
 }

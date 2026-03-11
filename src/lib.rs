@@ -161,6 +161,7 @@ impl WindowContext {
         pc_file: R,
         render_config: &RenderConfig,
         atlas_path: Option<&PathBuf>,
+        atlas_bytes: Option<Vec<u8>>,
     ) -> anyhow::Result<Self> {
         let mut size = window.inner_size();
         if size == PhysicalSize::new(0, 0) {
@@ -214,6 +215,9 @@ impl WindowContext {
         if let Some(atlas) = atlas_path {
             pc_raw.load_atlas_from_file(atlas)?;
             log::info!("loaded atlas from {:?}", atlas);
+        } else if let Some(bytes) = atlas_bytes {
+            pc_raw.load_atlas_from_bytes(&bytes)?;
+            log::info!("loaded atlas from bytes");
         }
         let pc = PointCloud::new(&device, pc_raw)?;
         log::info!("loaded point cloud with {:} points", pc.num_points());
@@ -628,6 +632,7 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
     pointcloud_file_path: Option<PathBuf>,
     scene_file_path: Option<PathBuf>,
     atlas_path: Option<PathBuf>,
+    atlas_bytes: Option<Vec<u8>>,
 ) {
     #[cfg(not(target_arch = "wasm32"))]
     env_logger::init();
@@ -697,7 +702,7 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
         })
         .unwrap_or(Duration::from_millis(17));
 
-    let mut state = WindowContext::new(window, file, &config, atlas_path.as_ref()).await.unwrap();
+    let mut state = WindowContext::new(window, file, &config, atlas_path.as_ref(), atlas_bytes).await.unwrap();
     state.pointcloud_file_path = pointcloud_file_path;
 
     if let Some(scene) = scene {
@@ -874,6 +879,7 @@ pub async fn run_wasm(
     scene: Option<Vec<u8>>,
     pc_file: Option<String>,
     scene_file: Option<String>,
+    atlas: Option<Vec<u8>>,
 ) {
     use std::{io::Cursor, str::FromStr};
 
@@ -892,5 +898,6 @@ pub async fn run_wasm(
         pc_file.and_then(|s| PathBuf::from_str(s.as_str()).ok()),
         scene_file.and_then(|s| PathBuf::from_str(s.as_str()).ok()),
         None,
+        atlas,
     ));
 }

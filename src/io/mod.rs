@@ -312,6 +312,56 @@ impl GenericGaussianPointCloud {
         self.kernel_type = kernel_type;
         Ok(())
     }
+
+    /// Load atlas textures from raw NATL bytes (for WASM where file paths aren't available).
+    pub fn load_atlas_from_bytes(&mut self, data: &[u8]) -> anyhow::Result<()> {
+        use std::io::Read as _;
+        let mut cursor = std::io::Cursor::new(data);
+        let mut magic = [0u8; 4];
+        cursor.read_exact(&mut magic)?;
+        if &magic != b"NATL" {
+            return Err(anyhow::anyhow!("Invalid atlas file magic (expected NATL)"));
+        }
+        let mut header = [0u8; 28];
+        cursor.read_exact(&mut header)?;
+        let w = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        let h = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+        let c = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
+        let kernel_type = u32::from_le_bytes([header[12], header[13], header[14], header[15]]);
+        let n = u32::from_le_bytes([header[16], header[17], header[18], header[19]]) as usize;
+        let uv_extent = f32::from_le_bytes([header[20], header[21], header[22], header[23]]);
+
+        if n != self.num_points {
+            return Err(anyhow::anyhow!(
+                "Atlas has {} rects but PLY has {} points",
+                n, self.num_points
+            ));
+        }
+
+        let rects_size = n * 4 * 4;
+        let mut rects_bytes = vec![0u8; rects_size];
+        cursor.read_exact(&mut rects_bytes)?;
+        let rects: Vec<f32> = bytemuck::cast_slice(&rects_bytes).to_vec();
+
+        let atlas_size = h as usize * w as usize * c as usize * 2;
+        let mut atlas_data = vec![0u8; atlas_size];
+        cursor.read_exact(&mut atlas_data)?;
+
+        log::info!(
+            "loaded atlas from bytes {}x{}x{}, {} rects, kernel_type={}, uv_extent={} ({:.1} MB)",
+            w, h, c, n, kernel_type, uv_extent,
+            (rects_size + atlas_size) as f64 / 1e6
+        );
+
+        self.atlas_texture = Some(atlas_data);
+        self.atlas_rects = Some(rects);
+        self.atlas_width = w;
+        self.atlas_height = h;
+        self.atlas_channels = c;
+        self.uv_extent = uv_extent;
+        self.kernel_type = kernel_type;
+        Ok(())
+    }
 }
 
 // Fit a plane to a collection of points.

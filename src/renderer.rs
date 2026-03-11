@@ -325,9 +325,35 @@ impl GaussianRenderer {
     ) {
         let camera = render_settings.camera;
         let uniform = self.camera.as_mut();
-        uniform.set_focal(camera.projection.focal(render_settings.viewport));
-        uniform.set_viewport(render_settings.viewport.cast().unwrap());
+        let focal = camera.projection.focal(render_settings.viewport);
+        let viewport = render_settings.viewport;
+        uniform.set_focal(focal);
+        uniform.set_viewport(viewport.cast().unwrap());
         uniform.set_camera(camera);
+
+        // DEBUG: print camera state
+        log::info!("=== PREPROCESS DEBUG ===");
+        log::info!("  viewport: {}x{}", viewport.x, viewport.y);
+        log::info!("  focal: ({:.2}, {:.2})", focal.x, focal.y);
+        log::info!("  cam pos: ({:.3}, {:.3}, {:.3})", camera.position.x, camera.position.y, camera.position.z);
+        log::info!("  znear: {:.4}, zfar: {:.4}", camera.projection.znear, camera.projection.zfar);
+        log::info!("  fovx: {:.4}, fovy: {:.4}", camera.projection.fovx.0, camera.projection.fovy.0);
+        log::info!("  is_2dgs: {}", self.is_2dgs);
+        log::info!("  num_points: {}", pc.num_points());
+        let bbox = pc.bbox();
+        log::info!("  bbox min: ({:.3}, {:.3}, {:.3})", bbox.min.x, bbox.min.y, bbox.min.z);
+        log::info!("  bbox max: ({:.3}, {:.3}, {:.3})", bbox.max.x, bbox.max.y, bbox.max.z);
+        let view = camera.view_matrix();
+        log::info!("  view[0]: ({:.4}, {:.4}, {:.4}, {:.4})", view[0][0], view[0][1], view[0][2], view[0][3]);
+        log::info!("  view[1]: ({:.4}, {:.4}, {:.4}, {:.4})", view[1][0], view[1][1], view[1][2], view[1][3]);
+        log::info!("  view[2]: ({:.4}, {:.4}, {:.4}, {:.4})", view[2][0], view[2][1], view[2][2], view[2][3]);
+        log::info!("  view[3]: ({:.4}, {:.4}, {:.4}, {:.4})", view[3][0], view[3][1], view[3][2], view[3][3]);
+        let proj = camera.proj_matrix();
+        log::info!("  proj[0]: ({:.4}, {:.4}, {:.4}, {:.4})", proj[0][0], proj[0][1], proj[0][2], proj[0][3]);
+        log::info!("  proj[1]: ({:.4}, {:.4}, {:.4}, {:.4})", proj[1][0], proj[1][1], proj[1][2], proj[1][3]);
+        log::info!("  proj[2]: ({:.4}, {:.4}, {:.4}, {:.4})", proj[2][0], proj[2][1], proj[2][2], proj[2][3]);
+        log::info!("  proj[3]: ({:.4}, {:.4}, {:.4}, {:.4})", proj[3][0], proj[3][1], proj[3][2], proj[3][3]);
+
         self.camera.sync(queue);
 
         let settings_uniform = self.render_settings.as_mut();

@@ -1,12 +1,13 @@
 #[cfg(feature = "npz")]
 use std::io::BufReader;
 use std::io::{Read, Seek};
+use std::path::Path;
 
 use bytemuck::Zeroable;
 use cgmath::{Array, EuclideanSpace, InnerSpace, Point3, Vector3};
 use half::f16;
 
-use crate::pointcloud::{Aabb, Covariance3D, Gaussian, GaussianCompressed, GaussianQuantization};
+use crate::pointcloud::{Aabb, Covariance3D, Gaussian, GaussianCompressed, GaussianQuantization, Surfel};
 
 #[cfg(feature = "npz")]
 use self::npz::NpzReader;
@@ -28,6 +29,7 @@ pub struct GenericGaussianPointCloud {
     gaussians: Vec<u8>,
     sh_coefs: Vec<u8>,
     compressed: bool,
+    pub is_2dgs: bool,
     pub covars: Option<Vec<Covariance3D>>,
     pub quantization: Option<GaussianQuantization>,
     pub sh_deg: u32,
@@ -39,6 +41,11 @@ pub struct GenericGaussianPointCloud {
     pub up: Option<Vector3<f32>>,
     pub center: Point3<f32>,
     pub aabb: Aabb<f32>,
+
+    // 2DGS texture data
+    pub residual_textures: Option<Vec<u8>>,
+    pub residual_dim: u32,
+    pub kernel_type: u32,
 }
 
 impl GenericGaussianPointCloud {
@@ -101,6 +108,57 @@ impl GenericGaussianPointCloud {
             center,
             aabb: bbox,
             compressed: false,
+            is_2dgs: false,
+            residual_textures: None,
+            residual_dim: 0,
+            kernel_type: 0,
+        }
+    }
+
+    /// Create from 2DGS surfel data
+    pub(crate) fn new_2dgs(
+        surfels: Vec<Surfel>,
+        sh_coefs: Vec<[[f16; 3]; 16]>,
+        sh_deg: u32,
+        num_points: usize,
+        kernel_size: Option<f32>,
+        mip_splatting: Option<bool>,
+        background_color: Option<[f32; 3]>,
+    ) -> Self {
+        let mut bbox: Aabb<f32> = Aabb::zeroed();
+        for v in &surfels {
+            bbox.grow(&v.xyz);
+        }
+
+        let (center, mut up) = plane_from_points(
+            surfels
+                .iter()
+                .map(|g| g.xyz.cast().unwrap())
+                .collect::<Vec<Point3<f32>>>()
+                .as_slice(),
+        );
+
+        if bbox.radius() < 10. {
+            up = None;
+        }
+        Self {
+            gaussians: bytemuck::cast_slice(&surfels).to_vec(),
+            sh_coefs: bytemuck::cast_slice(&sh_coefs).to_vec(),
+            sh_deg,
+            num_points,
+            kernel_size,
+            mip_splatting,
+            background_color,
+            covars: None,
+            quantization: None,
+            up,
+            center,
+            aabb: bbox,
+            compressed: false,
+            is_2dgs: true,
+            residual_textures: None,
+            residual_dim: 0,
+            kernel_type: 0,
         }
     }
 
@@ -146,6 +204,10 @@ impl GenericGaussianPointCloud {
             center,
             aabb: bbox,
             compressed: true,
+            is_2dgs: false,
+            residual_textures: None,
+            residual_dim: 0,
+            kernel_type: 0,
         }
     }
 
@@ -175,6 +237,53 @@ impl GenericGaussianPointCloud {
 
     pub fn compressed(&self) -> bool {
         self.compressed
+    }
+}
+
+impl GenericGaussianPointCloud {
+    /// Load residual textures from a binary file.
+    /// Format: [magic: 4 bytes "NTEX"] [num_points: u32] [grid_size: u32] [residual_dim: u32] [kernel_type: u32] [data: FP16]
+    pub fn load_textures_from_file(&mut self, path: &Path) -> anyhow::Result<()> {
+        use std::io::Read as _;
+        let mut file = std::fs::File::open(path)?;
+        let mut magic = [0u8; 4];
+        file.read_exact(&mut magic)?;
+        if &magic != b"NTEX" {
+            return Err(anyhow::anyhow!("Invalid texture file magic bytes"));
+        }
+        let mut header = [0u8; 16];
+        file.read_exact(&mut header)?;
+        let num_points = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+        let grid_size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
+        let residual_dim = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
+        let kernel_type = u32::from_le_bytes([header[12], header[13], header[14], header[15]]);
+
+        if num_points != self.num_points {
+            return Err(anyhow::anyhow!(
+                "Texture file has {} points but PLY has {}",
+                num_points,
+                self.num_points
+            ));
+        }
+
+        let data_size = num_points * grid_size * grid_size * residual_dim as usize * 2; // FP16
+        let mut data = vec![0u8; data_size];
+        file.read_exact(&mut data)?;
+
+        log::info!(
+            "loaded {} textures: {}x{} grid, {}D residuals, kernel_type={} ({:.1} MB)",
+            num_points,
+            grid_size,
+            grid_size,
+            residual_dim,
+            kernel_type,
+            data_size as f64 / 1e6
+        );
+
+        self.residual_textures = Some(data);
+        self.residual_dim = residual_dim;
+        self.kernel_type = kernel_type;
+        Ok(())
     }
 }
 

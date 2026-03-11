@@ -58,6 +58,45 @@ impl Gaussian {
     }
 }
 
+/// 2DGS surfel: 2D disk in 3D space (quaternion + 2 scales)
+/// Same size as Gaussian (28 bytes) for buffer compatibility
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Surfel {
+    pub xyz: Point3<f32>,     // 12 bytes
+    pub opacity: f16,         // 2 bytes
+    pub shape: f16,           // 2 bytes (activated beta/general kernel shape, 0 for Gaussian)
+    pub scale: [f16; 2],      // 4 bytes (sx, sy)
+    pub rotation: [f16; 4],   // 8 bytes (w, x, y, z)
+}
+// Total: 28 bytes
+
+unsafe impl bytemuck::Zeroable for Surfel {}
+unsafe impl bytemuck::Pod for Surfel {}
+
+impl Default for Surfel {
+    fn default() -> Self {
+        Self::zeroed()
+    }
+}
+
+impl Surfel {
+    pub fn new(xyz: Point3<f32>, opacity: f16, scale: [f16; 2], rotation: [f16; 4]) -> Self {
+        Self {
+            xyz,
+            opacity,
+            shape: f16::ZERO,
+            scale,
+            rotation,
+        }
+    }
+
+    pub fn with_shape(mut self, shape: f16) -> Self {
+        self.shape = shape;
+        self
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Covariance3D(pub [f16; 6]);
@@ -78,6 +117,7 @@ pub struct PointCloud {
     sh_deg: u32,
     bbox: Aabb<f32>,
     compressed: bool,
+    is_2dgs: bool,
 
     center: Point3<f32>,
     up: Option<Vector3<f32>>,
@@ -85,6 +125,15 @@ pub struct PointCloud {
     mip_splatting: Option<bool>,
     kernel_size: Option<f32>,
     background_color: Option<wgpu::Color>,
+
+    // 2DGS texture support
+    texture_buffer: Option<wgpu::Buffer>,
+    texture_bind_group: Option<wgpu::BindGroup>,
+    residual_dim: u32,
+    kernel_type: u32,
+    // Keep surfel buffer accessible for render shader (needs means3D for viewdir)
+    surfel_buffer: Option<wgpu::Buffer>,
+    surfel_render_bind_group: Option<wgpu::BindGroup>,
 }
 
 impl Debug for PointCloud {
@@ -100,9 +149,17 @@ impl PointCloud {
         device: &wgpu::Device,
         pc: GenericGaussianPointCloud,
     ) -> Result<Self, anyhow::Error> {
+        let is_2dgs = pc.is_2dgs;
+
+        let splat_size = if is_2dgs {
+            mem::size_of::<Splat2DGS>()
+        } else {
+            mem::size_of::<Splat>()
+        };
+
         let splat_2d_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("2d gaussians buffer"),
-            size: (pc.num_points * mem::size_of::<Splat>()) as u64,
+            label: Some("2d splats buffer"),
+            size: (pc.num_points * splat_size) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
@@ -176,6 +233,51 @@ impl PointCloud {
             })
         };
 
+        // 2DGS: create texture buffer and surfel render bind group
+        let mut texture_buffer = None;
+        let mut texture_bind_group = None;
+        let mut surfel_buffer_opt = None;
+        let mut surfel_render_bind_group = None;
+        let mut residual_dim = 0u32;
+
+        if is_2dgs {
+            // Surfel buffer for render pass (need means3D for viewdir)
+            let surfel_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("surfel buffer (render)"),
+                contents: pc.gaussian_buffer(),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            });
+
+            surfel_render_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("surfel render bind group"),
+                layout: &Self::bind_group_layout_surfel_render(device),
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: surfel_buf.as_entire_binding(),
+                }],
+            }));
+            surfel_buffer_opt = Some(surfel_buf);
+
+            // Texture buffer
+            if let Some(ref tex_data) = pc.residual_textures {
+                residual_dim = pc.residual_dim;
+                let tex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("residual textures buffer"),
+                    contents: tex_data,
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
+                texture_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("texture bind group"),
+                    layout: &Self::bind_group_layout_textures(device),
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: tex_buf.as_entire_binding(),
+                    }],
+                }));
+                texture_buffer = Some(tex_buf);
+            }
+        }
+
         Ok(Self {
             splat_2d_buffer,
 
@@ -184,6 +286,7 @@ impl PointCloud {
             num_points: pc.num_points as u32,
             sh_deg: pc.sh_deg,
             compressed: pc.compressed(),
+            is_2dgs,
             bbox: pc.aabb.into(),
             center: pc.center,
             up: pc.up,
@@ -195,6 +298,12 @@ impl PointCloud {
                 b: c[2] as f64,
                 a: 1.,
             }),
+            texture_buffer,
+            texture_bind_group,
+            residual_dim,
+            kernel_type: pc.kernel_type,
+            surfel_buffer: surfel_buffer_opt,
+            surfel_render_bind_group,
         })
     }
 
@@ -333,6 +442,38 @@ impl PointCloud {
         })
     }
 
+    pub fn bind_group_layout_surfel_render(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("surfel render bind group layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        })
+    }
+
+    pub fn bind_group_layout_textures(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("texture bind group layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        })
+    }
+
     pub fn mip_splatting(&self) -> Option<bool> {
         self.mip_splatting
     }
@@ -347,6 +488,30 @@ impl PointCloud {
     pub fn up(&self) -> Option<Vector3<f32>> {
         self.up
     }
+
+    pub fn is_2dgs(&self) -> bool {
+        self.is_2dgs
+    }
+
+    pub fn residual_dim(&self) -> u32 {
+        self.residual_dim
+    }
+
+    pub fn kernel_type(&self) -> u32 {
+        self.kernel_type
+    }
+
+    pub(crate) fn texture_bind_group(&self) -> Option<&wgpu::BindGroup> {
+        self.texture_bind_group.as_ref()
+    }
+
+    pub(crate) fn texture_buffer(&self) -> Option<&wgpu::Buffer> {
+        self.texture_buffer.as_ref()
+    }
+
+    pub(crate) fn surfel_render_bind_group(&self) -> Option<&wgpu::BindGroup> {
+        self.surfel_render_bind_group.as_ref()
+    }
 }
 
 #[repr(C)]
@@ -355,6 +520,23 @@ pub struct Splat {
     pub v: Vector4<f16>,
     pub pos: Vector2<f16>,
     pub color: Vector4<f16>,
+}
+
+/// 2DGS splat: screen-space data for ray-disk intersection rendering.
+/// Packed as u32 pairs (2 × f16 each). Total: 40 bytes (10 u32s).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Splat2DGS {
+    pub tu_01: u32,         // Tu.x, Tu.y
+    pub tu_2_tv_0: u32,     // Tu.z, Tv.x
+    pub tv_12: u32,         // Tv.y, Tv.z
+    pub tw_01: u32,         // Tw.x, Tw.y
+    pub tw_2_opa: u32,      // Tw.z, opacity
+    pub pos: u32,           // NDC center x, y
+    pub extent: u32,        // NDC extent x, y (for quad generation)
+    pub color_rg: u32,      // R, G
+    pub color_b_shape: u32, // B, shape (beta kernel parameter)
+    pub gauss_id: u32,      // original Gaussian index (for texture lookup)
 }
 
 #[repr(C)]

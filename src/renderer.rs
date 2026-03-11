@@ -14,6 +14,27 @@ use wgpu::{Extent3d, MultisampleState, include_wgsl};
 
 use cgmath::{EuclideanSpace, Matrix4, Point3, SquareMatrix, Vector2, Vector4};
 
+/// Uniform buffer for 2DGS texture parameters
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct TexParamsUniform {
+    pub residual_dim: u32,
+    pub kernel_type: u32,  // 0=Gaussian, 1=Beta, 2=Flex, 3=General, 4=BetaScaled
+    pub _pad1: u32,
+    pub _pad2: u32,
+}
+
+impl Default for TexParamsUniform {
+    fn default() -> Self {
+        Self {
+            residual_dim: 0,
+            kernel_type: 0,
+            _pad1: 0,
+            _pad2: 0,
+        }
+    }
+}
+
 pub struct GaussianRenderer {
     pipeline: wgpu::RenderPipeline,
     camera: UniformBuffer<CameraUniform>,
@@ -27,6 +48,11 @@ pub struct GaussianRenderer {
     color_format: wgpu::TextureFormat,
     sorter: GPURSSorter,
     sorter_suff: Option<PointCloudSortStuff>,
+
+    is_2dgs: bool,
+    // 2DGS-specific: bind group for textures+camera+params (group 3 in render shader)
+    tex_params: Option<UniformBuffer<TexParamsUniform>>,
+    render_tex_bind_group: Option<wgpu::BindGroup>,
 }
 
 impl GaussianRenderer {
@@ -37,50 +63,135 @@ impl GaussianRenderer {
         sh_deg: u32,
         compressed: bool,
     ) -> Self {
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("render pipeline layout"),
-            bind_group_layouts: &[
-                &PointCloud::bind_group_layout_render(device), // Needed for points_2d (on binding 2)
-                &GPURSSorter::bind_group_layout_rendering(device), // Needed for indices   (on binding 4)
-            ],
-            push_constant_ranges: &[],
-        });
+        Self::new_with_mode(device, queue, color_format, sh_deg, compressed, false, None).await
+    }
 
-        let shader = device.create_shader_module(wgpu::include_wgsl!("shaders/gaussian.wgsl"));
+    pub async fn new_2dgs(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        color_format: wgpu::TextureFormat,
+        sh_deg: u32,
+        pc: &PointCloud,
+    ) -> Self {
+        Self::new_with_mode(device, queue, color_format, sh_deg, false, true, Some(pc)).await
+    }
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("render pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: color_format,
-                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleStrip,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
+    async fn new_with_mode(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        color_format: wgpu::TextureFormat,
+        sh_deg: u32,
+        compressed: bool,
+        is_2dgs: bool,
+        pc: Option<&PointCloud>,
+    ) -> Self {
+        let pipeline = if is_2dgs {
+            // 2DGS render pipeline:
+            // Group 0: splat_2d (binding 2)
+            // Group 1: sort indices (binding 4)
+            // Group 2: surfels (binding 0)
+            // Group 3: textures (binding 0) + camera (binding 1) + tex_params (binding 2)
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("2dgs render pipeline layout"),
+                bind_group_layouts: &[
+                    &PointCloud::bind_group_layout_render(device),
+                    &GPURSSorter::bind_group_layout_rendering(device),
+                    &PointCloud::bind_group_layout_surfel_render(device),
+                    &Self::bind_group_layout_2dgs_render(device),
+                ],
+                push_constant_ranges: &[],
+            });
+
+            let shader_src = format!(
+                "const MAX_SH_DEG:u32 = {:}u;\n{:}",
+                sh_deg,
+                include_str!("shaders/gaussian_2dgs.wgsl")
+            );
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("2dgs render shader"),
+                source: wgpu::ShaderSource::Wgsl(shader_src.into()),
+            });
+
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("2dgs render pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: color_format,
+                        blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleStrip,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            })
+        } else {
+            // Standard 3DGS render pipeline
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("render pipeline layout"),
+                bind_group_layouts: &[
+                    &PointCloud::bind_group_layout_render(device),
+                    &GPURSSorter::bind_group_layout_rendering(device),
+                ],
+                push_constant_ranges: &[],
+            });
+
+            let shader = device.create_shader_module(wgpu::include_wgsl!("shaders/gaussian.wgsl"));
+
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("render pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: color_format,
+                        blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleStrip,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            })
+        };
 
         let draw_indirect_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("indirect draw buffer"),
@@ -105,7 +216,66 @@ impl GaussianRenderer {
         let sorter = GPURSSorter::new(device, queue).await;
 
         let camera = UniformBuffer::new_default(device, Some("camera uniform buffer"));
-        let preprocess = PreprocessPipeline::new(device, sh_deg, compressed);
+        let preprocess = PreprocessPipeline::new(device, sh_deg, compressed, is_2dgs);
+
+        // 2DGS-specific setup
+        let mut tex_params = None;
+        let mut render_tex_bind_group = None;
+        if is_2dgs {
+            let tp = UniformBuffer::new(
+                device,
+                TexParamsUniform {
+                    residual_dim: pc.map_or(0, |p| p.residual_dim()),
+                    kernel_type: pc.map_or(0, |p| p.kernel_type()),
+                    ..Default::default()
+                },
+                Some("tex params uniform buffer"),
+            );
+
+            // Create the render bind group for group 3:
+            // binding 0: textures, binding 1: camera, binding 2: tex_params
+            let layout = Self::bind_group_layout_2dgs_render(device);
+            let mut entries = vec![
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: camera.buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: tp.buffer().as_entire_binding(),
+                },
+            ];
+
+            // Use real texture buffer from PointCloud if available, else dummy
+            let dummy_tex_buf;
+            let tex_resource = if let Some(buf) = pc.and_then(|p| p.texture_buffer()) {
+                buf.as_entire_binding()
+            } else {
+                dummy_tex_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("dummy texture buffer"),
+                    size: 4,
+                    usage: wgpu::BufferUsages::STORAGE,
+                    mapped_at_creation: false,
+                });
+                dummy_tex_buf.as_entire_binding()
+            };
+            entries.insert(
+                0,
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: tex_resource,
+                },
+            );
+
+            render_tex_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("2dgs render tex bind group"),
+                layout: &layout,
+                entries: &entries,
+            }));
+
+            tex_params = Some(tp);
+        }
+
         GaussianRenderer {
             pipeline,
             camera,
@@ -119,6 +289,9 @@ impl GaussianRenderer {
                 device,
                 Some("render settings uniform buffer"),
             ),
+            is_2dgs,
+            tex_params,
+            render_tex_bind_group,
         }
     }
 
@@ -254,8 +427,18 @@ impl GaussianRenderer {
     ) {
         render_pass.set_bind_group(0, pc.render_bind_group(), &[]);
         render_pass.set_bind_group(1, &self.sorter_suff.as_ref().unwrap().sorter_render_bg, &[]);
-        render_pass.set_pipeline(&self.pipeline);
 
+        if self.is_2dgs {
+            // 2DGS: set surfel and texture bind groups
+            if let Some(surfel_bg) = pc.surfel_render_bind_group() {
+                render_pass.set_bind_group(2, surfel_bg, &[]);
+            }
+            if let Some(tex_bg) = &self.render_tex_bind_group {
+                render_pass.set_bind_group(3, tex_bg, &[]);
+            }
+        }
+
+        render_pass.set_pipeline(&self.pipeline);
         render_pass.draw_indirect(&self.draw_indirect_buffer, 0);
     }
 
@@ -275,6 +458,46 @@ impl GaussianRenderer {
                 },
                 count: None,
             }],
+        })
+    }
+
+    /// Bind group layout for 2DGS render pass group 3:
+    /// binding 0: textures (storage, read), binding 1: camera (uniform), binding 2: tex_params (uniform)
+    pub fn bind_group_layout_2dgs_render(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("2dgs render bind group layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
         })
     }
 
@@ -345,16 +568,22 @@ impl CameraUniform {
 struct PreprocessPipeline(wgpu::ComputePipeline);
 
 impl PreprocessPipeline {
-    fn new(device: &wgpu::Device, sh_deg: u32, compressed: bool) -> Self {
+    fn new(device: &wgpu::Device, sh_deg: u32, compressed: bool, is_2dgs: bool) -> Self {
+        // 2DGS and 3DGS use the same bind group layout for preprocess
+        // (camera, point cloud, sort, render settings)
+        let pc_layout = if is_2dgs {
+            PointCloud::bind_group_layout(device) // surfels use same layout as uncompressed
+        } else if compressed {
+            PointCloud::bind_group_layout_compressed(device)
+        } else {
+            PointCloud::bind_group_layout(device)
+        };
+
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("preprocess pipeline layout"),
             bind_group_layouts: &[
                 &UniformBuffer::<CameraUniform>::bind_group_layout(device),
-                &if !compressed {
-                    PointCloud::bind_group_layout(device)
-                } else {
-                    PointCloud::bind_group_layout_compressed(device)
-                },
+                &pc_layout,
                 &GPURSSorter::bind_group_layout_preprocess(device),
                 &UniformBuffer::<SplattingArgsUniform>::bind_group_layout(device),
             ],
@@ -363,7 +592,7 @@ impl PreprocessPipeline {
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("preprocess shader"),
-            source: wgpu::ShaderSource::Wgsl(Self::build_shader(sh_deg, compressed).into()),
+            source: wgpu::ShaderSource::Wgsl(Self::build_shader(sh_deg, compressed, is_2dgs).into()),
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("preprocess pipeline"),
@@ -376,8 +605,10 @@ impl PreprocessPipeline {
         Self(pipeline)
     }
 
-    fn build_shader(sh_deg: u32, compressed: bool) -> String {
-        let shader_src: &str = if !compressed {
+    fn build_shader(sh_deg: u32, compressed: bool, is_2dgs: bool) -> String {
+        let shader_src: &str = if is_2dgs {
+            include_str!("shaders/preprocess_2dgs.wgsl")
+        } else if !compressed {
             include_str!("shaders/preprocess.wgsl")
         } else {
             include_str!("shaders/preprocess_compressed.wgsl")

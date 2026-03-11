@@ -213,9 +213,12 @@ impl WindowContext {
         let pc = PointCloud::new(&device, pc_raw)?;
         log::info!("loaded point cloud with {:} points", pc.num_points());
 
-        let renderer =
+        let renderer = if pc.is_2dgs() {
+            GaussianRenderer::new_2dgs(&device, &queue, render_format, pc.sh_deg(), &pc).await
+        } else {
             GaussianRenderer::new(&device, &queue, render_format, pc.sh_deg(), pc.compressed())
-                .await;
+                .await
+        };
 
         let aabb = pc.bbox();
         let aspect = size.width as f32 / size.height as f32;

@@ -86,6 +86,7 @@ async fn render_views(
                     load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                     store: wgpu::StoreOp::Store,
                 },
+                depth_slice: None,
             })],
             depth_stencil_attachment: None,
             timestamp_writes: None,
@@ -134,6 +135,7 @@ async fn render_views(
                             load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                             store: wgpu::StoreOp::Store,
                         },
+                        depth_slice: None,
                     })],
                     depth_stencil_attachment: None,
                     timestamp_writes: None,
@@ -144,7 +146,7 @@ async fn render_views(
             queue.submit(std::iter::once(encoder.finish()));
         }
     }
-    device.poll(wgpu::MaintainBase::Wait);
+    device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
     let end = Instant::now();
     let duration = end - start;
     println!(

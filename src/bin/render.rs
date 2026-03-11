@@ -27,6 +27,10 @@ struct Opt {
     /// maximum allowed Spherical Harmonics (SH) degree
     #[arg(long, default_value_t = 3)]
     max_sh_deg: u32,
+
+    /// Atlas texture file (.natl) for 2DGS rendering
+    #[arg(long)]
+    atlas: Option<PathBuf>,
 }
 
 #[allow(unused)]
@@ -100,7 +104,7 @@ async fn render_views(
                 walltime: Duration::from_secs(100),
                 scene_center: None,
                 scene_extend: None,
-                background_color: wgpu::Color::TRANSPARENT,
+                background_color: wgpu::Color::BLACK,
             },
             &mut None,
         );
@@ -111,7 +115,7 @@ async fn render_views(
                     view: &target_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -149,13 +153,20 @@ async fn main() {
 
     println!("reading point cloud file '{}'", opt.input.to_string_lossy());
 
-    let pc_raw = GenericGaussianPointCloud::load(ply_file).unwrap();
+    let mut pc_raw = GenericGaussianPointCloud::load(ply_file).unwrap();
+    if let Some(ref atlas) = opt.atlas {
+        pc_raw.load_atlas_from_file(atlas).unwrap();
+        println!("loaded atlas from '{}'", atlas.to_string_lossy());
+    }
     let mut pc = PointCloud::new(&device, pc_raw).unwrap();
 
     let render_format = wgpu::TextureFormat::Rgba16Float;
 
-    let mut renderer =
-        GaussianRenderer::new(&device, &queue, render_format, pc.sh_deg(), pc.compressed()).await;
+    let mut renderer = if pc.is_2dgs() {
+        GaussianRenderer::new_2dgs(&device, &queue, render_format, pc.sh_deg(), &pc).await
+    } else {
+        GaussianRenderer::new(&device, &queue, render_format, pc.sh_deg(), pc.compressed()).await
+    };
 
     render_views(
         device,

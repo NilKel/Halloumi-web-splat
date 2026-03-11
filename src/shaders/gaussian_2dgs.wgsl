@@ -3,18 +3,18 @@
 
 const FilterInvSquare: f32 = 2.0;  // 1 / (FilterSize^2) where FilterSize = sqrt(0.5)
 
-// Splat2DGS: 40 bytes (10 u32s)
+// Splat2DGS: 64 bytes (16 u32s). Transmat at f32 precision.
 struct Splat2DGS {
-    tu_01: u32,
-    tu_2_tv_0: u32,
-    tv_12: u32,
-    tw_01: u32,
-    tw_2_opa: u32,
+    tu_x: f32, tu_y: f32, tu_z: f32,
+    tv_x: f32, tv_y: f32, tv_z: f32,
+    tw_x: f32, tw_y: f32, tw_z: f32,
+    opacity: f32,
     pos: u32,
     extent: u32,
     color_rg: u32,
     color_b_shape: u32,
     gauss_id: u32,
+    _pad: u32,
 };
 
 // Surfel struct (for means3D access)
@@ -85,17 +85,11 @@ fn vs_main(
 
     let splat = splats_2d[indices[in_instance_index]];
 
-    // Unpack transmat
-    let tu_xy = unpack2x16float(splat.tu_01);
-    let tu_z_tv_x = unpack2x16float(splat.tu_2_tv_0);
-    let tv_yz = unpack2x16float(splat.tv_12);
-    let tw_xy = unpack2x16float(splat.tw_01);
-    let tw_z_opa = unpack2x16float(splat.tw_2_opa);
-
-    out.Tu = vec3<f32>(tu_xy.x, tu_xy.y, tu_z_tv_x.x);
-    out.Tv = vec3<f32>(tu_z_tv_x.y, tv_yz.x, tv_yz.y);
-    out.Tw = vec3<f32>(tw_xy.x, tw_xy.y, tw_z_opa.x);
-    out.opacity = tw_z_opa.y;
+    // Read transmat at f32 precision
+    out.Tu = vec3<f32>(splat.tu_x, splat.tu_y, splat.tu_z);
+    out.Tv = vec3<f32>(splat.tv_x, splat.tv_y, splat.tv_z);
+    out.Tw = vec3<f32>(splat.tw_x, splat.tw_y, splat.tw_z);
+    out.opacity = splat.opacity;
 
     // Unpack center and extent (in NDC)
     let v_center = unpack2x16float(splat.pos);
@@ -113,8 +107,12 @@ fn vs_main(
     out.gauss_xyz = vec3<f32>(surfel.x, surfel.y, surfel.z);
 
     // Center in pixel coordinates (for rho2d)
+    // WebGPU viewport: pixel.x = (ndc.x+1)*W/2, pixel.y = (1-ndc.y)*H/2
     let viewport = camera.viewport;
-    out.center_pix = (v_center + 1.0) * viewport * 0.5;
+    out.center_pix = vec2<f32>(
+        (v_center.x + 1.0) * viewport.x * 0.5,
+        (1.0 - v_center.y) * viewport.y * 0.5
+    );
 
     // Generate quad vertex: expand AABB
     let x = f32(in_vertex_index % 2u == 0u) * 2.0 - 1.0;
@@ -136,8 +134,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let Tw = in.Tw;
 
     // Ray-disk intersection
-    let k = vec3<f32>(pix.x * Tw.x - Tu.x, pix.x * Tw.y - Tu.y, pix.x * Tw.z - Tu.z);
-    let l = vec3<f32>(pix.y * Tw.x - Tv.x, pix.y * Tw.y - Tv.y, pix.y * Tw.z - Tv.z);
+    let k = pix.x * Tw - Tu;
+    let l = pix.y * Tw - Tv;
     let p = cross(k, l);
 
     if abs(p.z) < 1e-6 {

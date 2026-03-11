@@ -28,7 +28,7 @@ impl PerspectiveCamera {
         let center = aabb.center();
         let radius = aabb.radius();
         let distance = self.position.distance(center);
-        let zfar = distance + radius;
+        let zfar = (distance + radius) * 2.0;
         let znear = (distance - radius).max(zfar / 1000.);
         self.projection.zfar = zfar;
         self.projection.znear = znear;

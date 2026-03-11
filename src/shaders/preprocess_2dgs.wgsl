@@ -42,19 +42,19 @@ struct Surfel {
     scale_rot: array<u32, 3> // [scale_xy, rot_wx, rot_yz] as packed f16 pairs
 };
 
-// 2DGS Splat output: transmat + AABB + color + ID
-// Total 40 bytes (10 u32s)
+// 2DGS Splat output: transmat (f32) + AABB + color + ID
+// Total 64 bytes (16 u32s). Transmat at f32 to avoid precision loss.
 struct Splat2DGS {
-    tu_01: u32,         // Tu.x, Tu.y
-    tu_2_tv_0: u32,     // Tu.z, Tv.x
-    tv_12: u32,         // Tv.y, Tv.z
-    tw_01: u32,         // Tw.x, Tw.y
-    tw_2_opa: u32,      // Tw.z, opacity
-    pos: u32,           // NDC center x, y
-    extent: u32,        // NDC extent x, y
-    color_rg: u32,      // R, G
-    color_b_shape: u32, // B, shape (beta kernel parameter)
+    tu_x: f32, tu_y: f32, tu_z: f32,
+    tv_x: f32, tv_y: f32, tv_z: f32,
+    tw_x: f32, tw_y: f32, tw_z: f32,
+    opacity: f32,
+    pos: u32,           // NDC center x, y (f16 pair)
+    extent: u32,        // NDC extent x, y (f16 pair)
+    color_rg: u32,      // R, G (f16 pair)
+    color_b_shape: u32, // B, shape (f16 pair)
     gauss_id: u32,      // original Gaussian index
+    _pad: u32,
 };
 
 struct DrawIndirect {
@@ -197,7 +197,7 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
         atomicAdd(&sort_dispatch.dispatch_x, 1u);
     }
 
-    if z <= 0.0 || z >= 1.0 || pos2d.x < -bounds || pos2d.x > bounds || pos2d.y < -bounds || pos2d.y > bounds {
+    if z <= 0.0 || pos2d.x < -bounds || pos2d.x > bounds || pos2d.y < -bounds || pos2d.y > bounds {
         return;
     }
 
@@ -206,13 +206,7 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
     let rot_wx = unpack2x16float(surfel.scale_rot[1]);
     let rot_yz = unpack2x16float(surfel.scale_rot[2]);
 
-    let walltime = render_settings.walltime;
-    var scale_mod = 0.0;
-    let dd = 5.0 * distance(render_settings.center, xyz) / render_settings.scene_extend;
-    if walltime > dd {
-        scale_mod = smoothstep(0.0, 1.0, walltime - dd);
-    }
-    let scaling = render_settings.gaussian_scaling * scale_mod;
+    let scaling = render_settings.gaussian_scaling;
 
     let sx = scale_packed.x * scaling;
     let sy = scale_packed.y * scaling;
@@ -422,22 +416,32 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
 
     let half_w = W_val / 2.0;
     let half_h = H_val / 2.0;
-    let cx = (W_val - 1.0) / 2.0;
-    let cy = (H_val - 1.0) / 2.0;
+    let cx = W_val / 2.0;
+    let cy = H_val / 2.0;
 
+    // Tu, Tv, Tw are ROWS of the pixel_homo mapping matrix, where pixel coords
+    // match @builtin(position) in the fragment shader.
+    //
+    // WebGPU viewport transform:
+    //   position.x = (ndc.x + 1) * W/2       → pixel_x_homo = clip.x * W/2 + clip.w * W/2
+    //   position.y = (1 - ndc.y) * H/2        → pixel_y_homo = -clip.y * H/2 + clip.w * H/2
+    //
+    // camera.proj includes VIEWPORT_Y_FLIP (negates clip.y), so the WebGPU viewport
+    // Y flip and the projection Y flip combine to give the correct screen position.
+    // But for the transmat we need pixel coords matching @builtin(position), hence -half_h.
     let Tu = vec3<f32>(
         cu.x * half_w + cu.w * cx,
-        cu.y * half_h + cu.w * cy,
-        cu.w
+        cv.x * half_w + cv.w * cx,
+        cp.x * half_w + cp.w * cx
     );
     let Tv = vec3<f32>(
-        cv.x * half_w + cv.w * cx,
-        cv.y * half_h + cv.w * cy,
-        cv.w
+        cu.y * (-half_h) + cu.w * cy,
+        cv.y * (-half_h) + cv.w * cy,
+        cp.y * (-half_h) + cp.w * cy
     );
     let Tw = vec3<f32>(
-        cp.x * half_w + cp.w * cx,
-        cp.y * half_h + cp.w * cy,
+        cu.w,
+        cv.w,
         cp.w
     );
 
@@ -473,18 +477,24 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
     // Store to output buffer
     let store_idx = atomicAdd(&sort_infos.keys_size, 1u);
 
-    // Pack transmat as f16 pairs
+    // Store transmat as f32 for precision, rest as f16 pairs
     splats_2d[store_idx] = Splat2DGS(
-        pack2x16float(vec2<f32>(Tu.x, Tu.y)),
-        pack2x16float(vec2<f32>(Tu.z, Tv.x)),
-        pack2x16float(vec2<f32>(Tv.y, Tv.z)),
-        pack2x16float(vec2<f32>(Tw.x, Tw.y)),
-        pack2x16float(vec2<f32>(Tw.z, opacity)),
-        pack2x16float(p_center / viewport),  // NDC center for vertex shader
-        pack2x16float(h / viewport),          // NDC extent for quad generation
+        Tu.x, Tu.y, Tu.z,
+        Tv.x, Tv.y, Tv.z,
+        Tw.x, Tw.y, Tw.z,
+        opacity,
+        // NDC center: x uses standard mapping, y uses WebGPU viewport convention
+        // WebGPU: pixel.x = (ndc.x+1)*W/2  →  ndc.x = 2*pixel.x/W - 1
+        // WebGPU: pixel.y = (1-ndc.y)*H/2   →  ndc.y = 1 - 2*pixel.y/H
+        pack2x16float(vec2<f32>(
+            p_center.x / viewport.x * 2.0 - 1.0,
+            1.0 - p_center.y / viewport.y * 2.0
+        )),
+        pack2x16float(h / viewport * 2.0),                // NDC extent (always positive)
         pack2x16float(color.rg),
         pack2x16float(vec2<f32>(color.b, shape)),
         idx,  // original Gaussian index for texture lookup
+        0u,   // padding
     );
 
     // Depth sorting

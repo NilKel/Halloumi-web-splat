@@ -19,6 +19,10 @@ struct Opt {
     /// Support HDR rendering
     #[arg(long, default_value_t = false)]
     hdr: bool,
+
+    /// Atlas texture file (.natl) for 2DGS rendering
+    #[arg(long)]
+    atlas: Option<PathBuf>,
 }
 
 /// check if there is a scene file in the same directory or parent directory as the input file
@@ -63,6 +67,7 @@ async fn main() {
         },
         Some(opt.input),
         opt.scene,
+        opt.atlas,
     )
     .await;
 }

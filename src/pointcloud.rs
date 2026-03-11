@@ -519,20 +519,21 @@ pub struct Splat {
 }
 
 /// 2DGS splat: screen-space data for ray-disk intersection rendering.
-/// Packed as u32 pairs (2 × f16 each). Total: 40 bytes (10 u32s).
+/// Transmat stored as f32 to avoid precision loss in ray-disk intersection.
+/// Total: 64 bytes (16 u32s).
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Splat2DGS {
-    pub tu_01: u32,         // Tu.x, Tu.y
-    pub tu_2_tv_0: u32,     // Tu.z, Tv.x
-    pub tv_12: u32,         // Tv.y, Tv.z
-    pub tw_01: u32,         // Tw.x, Tw.y
-    pub tw_2_opa: u32,      // Tw.z, opacity
-    pub pos: u32,           // NDC center x, y
-    pub extent: u32,        // NDC extent x, y (for quad generation)
-    pub color_rg: u32,      // R, G
-    pub color_b_shape: u32, // B, shape (beta kernel parameter)
-    pub gauss_id: u32,      // original Gaussian index (for texture lookup)
+    pub tu: [f32; 3],       // Tu (row 0 of transmat)
+    pub tv: [f32; 3],       // Tv (row 1 of transmat)
+    pub tw: [f32; 3],       // Tw (row 2 of transmat)
+    pub opacity: f32,        // opacity
+    pub pos: u32,            // NDC center x, y (f16 pair)
+    pub extent: u32,         // NDC extent x, y (f16 pair)
+    pub color_rg: u32,       // R, G (f16 pair)
+    pub color_b_shape: u32,  // B, shape (f16 pair)
+    pub gauss_id: u32,       // original Gaussian index (for texture lookup)
+    pub _pad: u32,           // alignment padding
 }
 
 #[repr(C)]

@@ -438,12 +438,20 @@ impl GaussianRenderer {
             stopwatch.stop(encoder, "sorting").unwrap();
         }
 
+        // copy keys_size from sort uniform to draw_indirect instance_count
         encoder.copy_buffer_to_buffer(
             &self.sorter_suff.as_ref().unwrap().sorter_uni,
             0,
             &self.draw_indirect_buffer,
             std::mem::size_of::<u32>() as u64,
             std::mem::size_of::<u32>() as u64,
+        );
+        // DEBUG: also write a fixed instance count to test if queue.write_buffer works
+        // (queue.write_buffer executes BEFORE encoder commands, so the copy should overwrite this)
+        queue.write_buffer(
+            &self.draw_indirect_buffer,
+            4,
+            &77u32.to_le_bytes(),
         );
     }
 

@@ -365,25 +365,27 @@ impl GaussianRenderer {
         self.render_settings.sync(queue);
 
         // TODO perform this in vertex buffer after draw call
+        // DEBUG: write 42 as instance_count to test readback pipeline
         queue.write_buffer(
             &self.draw_indirect_buffer,
             0,
             wgpu::util::DrawIndirectArgs {
                 vertex_count: 4,
-                instance_count: 0,
+                instance_count: 42,
                 first_vertex: 0,
                 first_instance: 0,
             }
             .as_bytes(),
         );
-        let depth_buffer = &self.sorter_suff.as_ref().unwrap().sorter_bg_pre;
-        self.preprocess.run(
-            encoder,
-            pc,
-            &self.camera,
-            &self.render_settings,
-            depth_buffer,
-        );
+        // DEBUG: skip compute and copy entirely — just test CPU write + readback
+        // let depth_buffer = &self.sorter_suff.as_ref().unwrap().sorter_bg_pre;
+        // self.preprocess.run(
+        //     encoder,
+        //     pc,
+        //     &self.camera,
+        //     &self.render_settings,
+        //     depth_buffer,
+        // );
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -460,13 +462,14 @@ impl GaussianRenderer {
             stopwatch.stop(encoder, "sorting").unwrap();
         }
 
-        encoder.copy_buffer_to_buffer(
-            &self.sorter_suff.as_ref().unwrap().sorter_uni,
-            0,
-            &self.draw_indirect_buffer,
-            std::mem::size_of::<u32>() as u64,
-            std::mem::size_of::<u32>() as u64,
-        );
+        // DEBUG: disabled — testing CPU write + readback only
+        // encoder.copy_buffer_to_buffer(
+        //     &self.sorter_suff.as_ref().unwrap().sorter_uni,
+        //     0,
+        //     &self.draw_indirect_buffer,
+        //     std::mem::size_of::<u32>() as u64,
+        //     std::mem::size_of::<u32>() as u64,
+        // );
     }
 
     pub fn render<'rpass>(

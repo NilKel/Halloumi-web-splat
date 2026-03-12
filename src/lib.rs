@@ -448,7 +448,7 @@ impl WindowContext {
                 &self.wgpu_context.queue,
                 &self.pc,
                 self.splatting_args,
-                (&mut self.stopwatch).into(),
+                &mut None,  // no stopwatch on compute encoder
             );
 
             self.wgpu_context.queue.submit([compute_encoder.finish()]);

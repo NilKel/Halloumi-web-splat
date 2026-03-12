@@ -192,7 +192,7 @@ impl WindowContext {
         let render_format = if render_config.hdr {
             wgpu::TextureFormat::Rgba16Float
         } else {
-            wgpu::TextureFormat::Rgba8Unorm
+            surface_format.remove_srgb_suffix()
         };
 
         let config = wgpu::SurfaceConfiguration {

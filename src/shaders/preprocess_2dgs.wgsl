@@ -194,10 +194,6 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
     let bounds = 1.2 * pos2d.w;
     let z = pos2d.z / pos2d.w;
 
-    if idx == 0u {
-        atomicAdd(&sort_dispatch.dispatch_x, 1u);
-    }
-
     if z <= 0.0 || pos2d.x < -bounds || pos2d.x > bounds || pos2d.y < -bounds || pos2d.y > bounds {
         return;
     }
@@ -432,17 +428,17 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
     // But for the transmat we need pixel coords matching @builtin(position), hence -half_h.
     let Tu = vec3<f32>(
         cu.x * half_w + cu.w * cx,
-        cv.x * half_w + cv.w * cx,
-        cp.x * half_w + cp.w * cx
+        cu.y * (-half_h) + cu.w * cy,
+        cu.w
     );
     let Tv = vec3<f32>(
-        cu.y * (-half_h) + cu.w * cy,
+        cv.x * half_w + cv.w * cx,
         cv.y * (-half_h) + cv.w * cy,
-        cp.y * (-half_h) + cp.w * cy
+        cv.w
     );
     let Tw = vec3<f32>(
-        cu.w,
-        cv.w,
+        cp.x * half_w + cp.w * cx,
+        cp.y * (-half_h) + cp.w * cy,
         cp.w
     );
 

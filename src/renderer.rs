@@ -358,6 +358,10 @@ impl GaussianRenderer {
 
         let settings_uniform = self.render_settings.as_mut();
         *settings_uniform = SplattingArgsUniform::from_args_and_pc(render_settings, pc);
+        log::info!("  clip_min: ({:.4}, {:.4}, {:.4})", settings_uniform.clipping_box_min.x, settings_uniform.clipping_box_min.y, settings_uniform.clipping_box_min.z);
+        log::info!("  clip_max: ({:.4}, {:.4}, {:.4})", settings_uniform.clipping_box_max.x, settings_uniform.clipping_box_max.y, settings_uniform.clipping_box_max.z);
+        log::info!("  gaussian_scaling: {:.4}", settings_uniform.gaussian_scaling);
+        log::info!("  max_sh_deg: {}", settings_uniform.max_sh_deg);
         self.render_settings.sync(queue);
 
         // TODO perform this in vertex buffer after draw call

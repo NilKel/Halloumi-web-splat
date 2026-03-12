@@ -91,52 +91,10 @@ fn vs_main(
 ) -> VertexOutput {
     var out: VertexOutput;
 
-    // Cull instances beyond visible count (workaround for Metal which can't use draw_indirect)
-    let visible_count = sort_infos.keys_size;
-    if in_instance_index >= visible_count {
-        out.position = vec4<f32>(0.0, 0.0, 2.0, 1.0);  // behind far plane
-        return out;
-    }
-
-    let splat = splats_2d[indices[in_instance_index]];
-
-    // Read transmat at f32 precision
-    out.Tu = vec3<f32>(splat.tu_x, splat.tu_y, splat.tu_z);
-    out.Tv = vec3<f32>(splat.tv_x, splat.tv_y, splat.tv_z);
-    out.Tw = vec3<f32>(splat.tw_x, splat.tw_y, splat.tw_z);
-    out.opacity = splat.opacity;
-
-    // Unpack center and extent (in NDC)
-    let v_center = unpack2x16float(splat.pos);
-    let v_extent = unpack2x16float(splat.extent);
-
-    // Unpack base color + shape
-    let rg = unpack2x16float(splat.color_rg);
-    let b_shape = unpack2x16float(splat.color_b_shape);
-    out.base_color = vec3<f32>(rg.x, rg.y, b_shape.x);
-    out.shape = b_shape.y;
-
-    // Gaussian ID and position
-    out.gauss_id = splat.gauss_id;
-    let surfel = surfels[splat.gauss_id];
-    out.gauss_xyz = vec3<f32>(surfel.x, surfel.y, surfel.z);
-
-    // Center in pixel coordinates (for rho2d)
-    // WebGPU viewport: pixel.x = (ndc.x+1)*W/2, pixel.y = (1-ndc.y)*H/2
-    let viewport = camera.viewport;
-    out.center_pix = vec2<f32>(
-        (v_center.x + 1.0) * viewport.x * 0.5,
-        (1.0 - v_center.y) * viewport.y * 0.5
-    );
-
-    // Generate quad vertex: expand AABB
+    // DEBUG: fullscreen quad for ALL instances to test if render pipeline works
     let x = f32(in_vertex_index % 2u == 0u) * 2.0 - 1.0;
     let y = f32(in_vertex_index < 2u) * 2.0 - 1.0;
-
-    let margin = 1.2;
-    let offset = vec2<f32>(x, y) * v_extent * margin;
-    out.position = vec4<f32>(v_center + offset, 0.0, 1.0);
-
+    out.position = vec4<f32>(x, y, 0.0, 1.0);
     return out;
 }
 

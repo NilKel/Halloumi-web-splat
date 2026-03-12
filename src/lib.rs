@@ -171,7 +171,10 @@ impl WindowContext {
 
         let window = Arc::new(window);
 
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::from_env().unwrap_or(wgpu::Backends::PRIMARY),
+            ..Default::default()
+        });
 
         let surface: wgpu::Surface = instance.create_surface(window.clone())?;
 

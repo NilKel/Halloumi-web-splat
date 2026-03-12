@@ -317,6 +317,10 @@ impl GaussianRenderer {
         &self.camera
     }
 
+    pub(crate) fn draw_indirect_buffer_ref(&self) -> &wgpu::Buffer {
+        &self.draw_indirect_buffer
+    }
+
     fn preprocess<'a>(
         &'a mut self,
         encoder: &'a mut wgpu::CommandEncoder,
@@ -456,13 +460,6 @@ impl GaussianRenderer {
             stopwatch.stop(encoder, "sorting").unwrap();
         }
 
-        // DEBUG: create fresh buffer with 42, copy to draw_indirect via encoder
-        let test_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("test buffer"),
-            contents: &42u32.to_le_bytes(),
-            usage: wgpu::BufferUsages::COPY_SRC,
-        });
-        encoder.copy_buffer_to_buffer(&test_buf, 0, &self.draw_indirect_buffer, 4, 4);
     }
 
     pub fn render<'rpass>(

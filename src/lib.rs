@@ -500,6 +500,14 @@ impl WindowContext {
         if let Some(ui_state) = ui_state {
             self.ui_renderer.cleanup(ui_state)
         }
+
+        // DEBUG: write 42 directly to draw_indirect via queue.write_buffer right before submit
+        self.wgpu_context.queue.write_buffer(
+            &self.renderer.draw_indirect_buffer_ref(),
+            4,
+            &42u32.to_le_bytes(),
+        );
+
         self.wgpu_context.queue.submit([encoder.finish()]);
 
         output.present();

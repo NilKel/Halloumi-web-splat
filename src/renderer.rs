@@ -11,6 +11,7 @@ use std::num::NonZeroU64;
 use std::time::Duration;
 
 use wgpu::{Extent3d, MultisampleState, include_wgsl};
+use wgpu::util::DeviceExt;
 
 use cgmath::{EuclideanSpace, Matrix4, Point3, SquareMatrix, Vector2, Vector4};
 
@@ -365,7 +366,7 @@ impl GaussianRenderer {
         self.render_settings.sync(queue);
 
         // TODO perform this in vertex buffer after draw call
-        // DEBUG: zero draw_indirect normally
+        // DEBUG: zero draw_indirect
         queue.write_buffer(
             &self.draw_indirect_buffer,
             0,
@@ -377,13 +378,14 @@ impl GaussianRenderer {
             }
             .as_bytes(),
         );
-        // DEBUG: write 42 to sorter_uni[0] from CPU — the copy should transfer this to draw_indirect
-        queue.write_buffer(
-            &self.sorter_suff.as_ref().unwrap().sorter_uni,
-            0,
-            &42u32.to_le_bytes(),
-        );
-        // Skip compute — pure copy test
+        // DEBUG: create a fresh test buffer with value 42, copy it to draw_indirect
+        let test_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("test buffer"),
+            contents: &42u32.to_le_bytes(),
+            usage: wgpu::BufferUsages::COPY_SRC,
+        });
+        encoder.copy_buffer_to_buffer(&test_buf, 0, &self.draw_indirect_buffer, 4, 4);
+        // Skip compute
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -461,15 +463,14 @@ impl GaussianRenderer {
             stopwatch.stop(encoder, "sorting").unwrap();
         }
 
-        // DEBUG: copy re-enabled — will overwrite CPU's 42 with sorter_uni[0]
-        // If we read 100: compute atomics work. If 0: atomics broken on Metal.
-        encoder.copy_buffer_to_buffer(
-            &self.sorter_suff.as_ref().unwrap().sorter_uni,
-            0,
-            &self.draw_indirect_buffer,
-            std::mem::size_of::<u32>() as u64,
-            std::mem::size_of::<u32>() as u64,
-        );
+        // DEBUG: disabled — using test_buf copy instead
+        // encoder.copy_buffer_to_buffer(
+        //     &self.sorter_suff.as_ref().unwrap().sorter_uni,
+        //     0,
+        //     &self.draw_indirect_buffer,
+        //     std::mem::size_of::<u32>() as u64,
+        //     std::mem::size_of::<u32>() as u64,
+        // );
     }
 
     pub fn render<'rpass>(

@@ -365,27 +365,25 @@ impl GaussianRenderer {
         self.render_settings.sync(queue);
 
         // TODO perform this in vertex buffer after draw call
-        // DEBUG: write 42 as instance_count to test readback pipeline
+        // DEBUG: zero draw_indirect normally
         queue.write_buffer(
             &self.draw_indirect_buffer,
             0,
             wgpu::util::DrawIndirectArgs {
                 vertex_count: 4,
-                instance_count: 42,
+                instance_count: 0,
                 first_vertex: 0,
                 first_instance: 0,
             }
             .as_bytes(),
         );
-        // DEBUG: compute re-enabled, copy still disabled — testing if compute interferes
-        let depth_buffer = &self.sorter_suff.as_ref().unwrap().sorter_bg_pre;
-        self.preprocess.run(
-            encoder,
-            pc,
-            &self.camera,
-            &self.render_settings,
-            depth_buffer,
+        // DEBUG: write 42 to sorter_uni[0] from CPU — the copy should transfer this to draw_indirect
+        queue.write_buffer(
+            &self.sorter_suff.as_ref().unwrap().sorter_uni,
+            0,
+            &42u32.to_le_bytes(),
         );
+        // Skip compute — pure copy test
     }
 
     #[cfg(not(target_arch = "wasm32"))]

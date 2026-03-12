@@ -1,5 +1,6 @@
 // 2DGS Surfel Preprocessing Shader
-// Computes transmat [Tu, Tv, Tw] for ray-disk intersection rendering
+// Projects surfel axes (L0, L1) to 2D covariance, eigendecomposes,
+// and outputs eigenvectors in the same format as 3DGS for rendering.
 
 //const MAX_SH_DEG:u32 = <injected>u;
 
@@ -42,15 +43,17 @@ struct Surfel {
     scale_rot: array<u32, 3> // [scale_xy, rot_wx, rot_yz] as packed f16 pairs
 };
 
-// 2DGS Splat output: transmat (f32) + AABB + color + ID
-// Total 64 bytes (16 u32s). Transmat at f32 to avoid precision loss.
+// Splat2DGS: 64 bytes. Repurposed for eigenvector storage:
+// tu_x, tu_y = v1 / viewport (eigenvector 1 in NDC half-units)
+// tu_z, tv_x = v2 / viewport (eigenvector 2 in NDC half-units)
+// Remaining f32 fields unused (zeroed).
 struct Splat2DGS {
     tu_x: f32, tu_y: f32, tu_z: f32,
     tv_x: f32, tv_y: f32, tv_z: f32,
     tw_x: f32, tw_y: f32, tw_z: f32,
     opacity: f32,
     pos: u32,           // NDC center x, y (f16 pair)
-    extent: u32,        // NDC extent x, y (f16 pair)
+    extent: u32,        // unused
     color_rg: u32,      // R, G (f16 pair)
     color_b_shape: u32, // B, shape (f16 pair)
     gauss_id: u32,      // original Gaussian index
@@ -174,6 +177,7 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
         return;
     }
 
+    let focal = camera.focal;
     let viewport = camera.viewport;
     let surfel = surfels[idx];
     let xyz = vec3<f32>(surfel.x, surfel.y, surfel.z);
@@ -194,7 +198,11 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
     let bounds = 1.2 * pos2d.w;
     let z = pos2d.z / pos2d.w;
 
-    if z <= 0.0 || pos2d.x < -bounds || pos2d.x > bounds || pos2d.y < -bounds || pos2d.y > bounds {
+    if idx == 0u {
+        atomicAdd(&sort_dispatch.dispatch_x, 1u);
+    }
+
+    if z <= 0.0 || z >= 1.0 || pos2d.x < -bounds || pos2d.x > bounds || pos2d.y < -bounds || pos2d.y > bounds {
         return;
     }
 
@@ -204,77 +212,58 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
     let rot_yz = unpack2x16float(surfel.scale_rot[2]);
 
     let scaling = render_settings.gaussian_scaling;
-
     let sx = scale_packed.x * scaling;
     let sy = scale_packed.y * scaling;
     let rot = vec4<f32>(rot_wx.x, rot_wx.y, rot_yz.x, rot_yz.y);
 
-    // Build rotation matrix and local frame
+    // Build rotation matrix and surfel local frame
     let R = quat_to_rotmat(rot);
-    // L = R * S where S = diag(sx, sy) — only first two columns
-    let L0 = R[0] * sx;  // first column of local frame
-    let L1 = R[1] * sy;  // second column of local frame
+    let L0 = R[0] * sx;  // u-direction in world space
+    let L1 = R[1] * sy;  // v-direction in world space
 
-    // Normal = cross(L0, L1) normalized
-    var normal = cross(L0, L1);
-    let normal_len = length(normal);
-    if normal_len > 1e-7 {
-        normal = normal / normal_len;
-    }
-
-    // Transform normal to view space for backface culling
-    let view_normal = (camera.view * vec4<f32>(normal, 0.0)).xyz;
-    let ray_dir = camspace.xyz;
-    if dot(view_normal, ray_dir) > 0.0 {
-        normal = -normal;
-    }
-
-    // Compute transmat in CLIP-HOMOGENEOUS space (no ndc2pix).
-    // Tu, Tv, Tw are columns of T: clip_homo = u*Tu + v*Tv + Tw
-    // where clip_homo = (clip.x, clip.y, clip.w) and NDC = clip.xy / clip.w
-    //
-    // The AABB computed from this transmat gives center/extent directly in NDC.
-    // The fragment shader converts @builtin(position) to NDC for ray-disk intersection.
-    let mvp = camera.proj * camera.view;
-
-    let cp = mvp * vec4<f32>(xyz, 1.0);
-    let cu = mvp * vec4<f32>(L0, 0.0);
-    let cv_clip = mvp * vec4<f32>(L1, 0.0);
-
-    // Tu, Tv, Tw are ROWS of the forward mapping matrix M (not columns).
-    // M maps (u, v, 1) -> (clip.x, clip.y, clip.w).
-    // CUDA stores T = transpose(M), and T[0..2] = columns of T = rows of M.
-    let Tu = vec3<f32>(cu.x, cv_clip.x, cp.x);
-    let Tv = vec3<f32>(cu.y, cv_clip.y, cp.y);
-    let Tw = vec3<f32>(cu.w, cv_clip.w, cp.w);
-
-    // Compute AABB from transmat — result is in NDC space
-    let cutoff = 4.0;
-    let t = vec3<f32>(cutoff * cutoff, cutoff * cutoff, -1.0);
-    let T2_sq = Tw * Tw;
-    let d = dot(t, T2_sq);
-    if d == 0.0 {
-        return;
-    }
-    let f = (1.0 / d) * t;
-
-    let ndc_center = vec2<f32>(
-        dot(f, Tu * Tw),
-        dot(f, Tv * Tw)
+    // Compute 3D covariance from surfel axes: Vrk = L0*L0^T + L1*L1^T
+    // (rank-2 covariance — flat disk in 3D)
+    let Vrk = mat3x3<f32>(
+        vec3<f32>(L0.x*L0.x + L1.x*L1.x, L0.y*L0.x + L1.y*L1.x, L0.z*L0.x + L1.z*L1.x),
+        vec3<f32>(L0.x*L0.y + L1.x*L1.y, L0.y*L0.y + L1.y*L1.y, L0.z*L0.y + L1.z*L1.y),
+        vec3<f32>(L0.x*L0.z + L1.x*L1.z, L0.y*L0.z + L1.y*L1.z, L0.z*L0.z + L1.z*L1.z),
     );
 
-    let h0 = ndc_center * ndc_center - vec2<f32>(
-        dot(f, Tu * Tu),
-        dot(f, Tv * Tv)
+    // Project to 2D covariance (identical to 3DGS path)
+    let J = mat3x3<f32>(
+        focal.x / camspace.z,
+        0.,
+        -(focal.x * camspace.x) / (camspace.z * camspace.z),
+        0.,
+        -focal.y / camspace.z,
+        (focal.y * camspace.y) / (camspace.z * camspace.z),
+        0.,
+        0.,
+        0.
     );
-    let ndc_ext = sqrt(max(vec2<f32>(1e-4, 1e-4), h0));
 
-    // Cull if AABB center is way off screen
-    if any(abs(ndc_center) > 1.5 + ndc_ext) {
-        return;
-    }
+    let W = transpose(mat3x3<f32>(camera.view[0].xyz, camera.view[1].xyz, camera.view[2].xyz));
+    let T = W * J;
+    let cov = transpose(T) * Vrk * T;
 
-    // Evaluate SH for base color
+    // Eigendecomposition of 2D covariance (identical to 3DGS)
+    let kernel_size = render_settings.kernel_size;
+    let diagonal1 = cov[0][0] + kernel_size;
+    let offDiagonal = cov[0][1];
+    let diagonal2 = cov[1][1] + kernel_size;
+
+    let mid = 0.5 * (diagonal1 + diagonal2);
+    let radius = length(vec2<f32>((diagonal1 - diagonal2) / 2.0, offDiagonal));
+    let lambda1 = mid + radius;
+    let lambda2 = max(mid - radius, 0.1);
+
+    let diagonalVector = normalize(vec2<f32>(offDiagonal, lambda1 - diagonal1));
+    let v1 = sqrt(2.0 * lambda1) * diagonalVector;
+    let v2 = sqrt(2.0 * lambda2) * vec2<f32>(diagonalVector.y, -diagonalVector.x);
+
+    let v_center = pos2d.xyzw / pos2d.w;
+
+    // SH color
     let camera_pos = camera.view_inv[3].xyz;
     let dir = normalize(xyz - camera_pos);
     let color = vec4<f32>(
@@ -285,21 +274,24 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
     // Store to output buffer
     let store_idx = atomicAdd(&sort_infos.keys_size, 1u);
 
+    // Pack eigenvectors into Splat2DGS fields:
+    // tu_x, tu_y = v1 / viewport
+    // tu_z, tv_x = v2 / viewport
+    let v_scaled = vec4<f32>(v1 / viewport, v2 / viewport);
     splats_2d[store_idx] = Splat2DGS(
-        Tu.x, Tu.y, Tu.z,
-        Tv.x, Tv.y, Tv.z,
-        Tw.x, Tw.y, Tw.z,
+        v_scaled.x, v_scaled.y, v_scaled.z,  // v1/viewport, v2.x/viewport
+        v_scaled.w, 0.0, 0.0,                // v2.y/viewport, unused, unused
+        0.0, 0.0, 0.0,                       // unused
         opacity,
-        pack2x16float(ndc_center),
-        pack2x16float(ndc_ext),
-        pack2x16float(vec2<f32>(color.x, color.y)),
-        pack2x16float(vec2<f32>(color.z, shape)),
+        pack2x16float(v_center.xy),
+        0u,
+        pack2x16float(color.rg),
+        pack2x16float(vec2<f32>(color.b, shape)),
         idx,
         0u,
     );
 
     // Depth sorting
-    let znear = -camera.proj[3][2] / camera.proj[2][2];
     let zfar = -camera.proj[3][2] / (camera.proj[2][2] - 1.0);
     sort_depths[store_idx] = bitcast<u32>(zfar - pos2d.z);
     sort_indices[store_idx] = store_idx;

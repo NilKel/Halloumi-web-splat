@@ -144,6 +144,7 @@ impl GPURSSorter {
         &self,
         device: &wgpu::Device,
         num_points: usize,
+        draw_indirect_buffer: &wgpu::Buffer,
     ) -> PointCloudSortStuff {
         let (sorter_b_a, sorter_b_b, sorter_p_a, sorter_p_b) =
             GPURSSorter::create_keyval_buffers(device, num_points, 4);
@@ -164,6 +165,7 @@ impl GPURSSorter {
             &sorter_dis,
             &sorter_b_a,
             &sorter_p_a,
+            draw_indirect_buffer,
         );
 
         PointCloudSortStuff {
@@ -487,6 +489,16 @@ impl GPURSSorter {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
     }
@@ -735,6 +747,7 @@ impl GPURSSorter {
         dispatch_buffer: &wgpu::Buffer,
         keyval_a: &wgpu::Buffer,
         payload_a: &wgpu::Buffer,
+        draw_indirect_buffer: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Preprocess bind group"),
@@ -755,6 +768,10 @@ impl GPURSSorter {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: dispatch_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: draw_indirect_buffer.as_entire_binding(),
                 },
             ],
         });

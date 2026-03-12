@@ -104,6 +104,8 @@ var<storage, read_write> sort_depths : array<u32>;
 var<storage, read_write> sort_indices : array<u32>;
 @group(2) @binding(3)
 var<storage, read_write> sort_dispatch: DispatchIndirect;
+@group(2) @binding(4)
+var<storage, read_write> draw_indirect: DrawIndirect;
 
 @group(3) @binding(0)
 var<uniform> render_settings: RenderSettings;
@@ -259,6 +261,7 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
     );
 
     let store_idx = atomicAdd(&sort_infos.keys_size, 1u);
+    atomicAdd(&draw_indirect.instance_count, 1u);
     let v = vec4<f32>(v1 / viewport, v2 / viewport);
     points_2d[store_idx] = Splat(
         pack2x16float(v.xy), pack2x16float(v.zw),

@@ -108,6 +108,8 @@ var<storage, read_write> sort_depths : array<u32>;
 var<storage, read_write> sort_indices : array<u32>;
 @group(2) @binding(3)
 var<storage, read_write> sort_dispatch: DispatchIndirect;
+@group(2) @binding(4)
+var<storage, read_write> draw_indirect: DrawIndirect;
 
 @group(3) @binding(0)
 var<uniform> render_settings: RenderSettings;
@@ -170,17 +172,6 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
     let idx = gid.x;
     if idx >= arrayLength(&surfels) {
         return;
-    }
-
-    // DEBUG: test if atomics + copy work on Metal
-    if idx == 0u {
-        let test_idx = atomicAdd(&sort_infos.keys_size, 1u);
-        sort_depths[test_idx] = 1000u;
-        sort_indices[test_idx] = 0u;
-        let keys_per_wg = 256u * 15u;
-        if (test_idx % keys_per_wg) == 0u {
-            atomicAdd(&sort_dispatch.dispatch_x, 1u);
-        }
     }
 
     let viewport = camera.viewport;
@@ -486,6 +477,8 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
 
     // Store to output buffer
     let store_idx = atomicAdd(&sort_infos.keys_size, 1u);
+    // Write instance_count directly (copy_buffer_to_buffer broken on Metal)
+    atomicAdd(&draw_indirect.instance_count, 1u);
 
     // Store transmat as f32 for precision, rest as f16 pairs
     splats_2d[store_idx] = Splat2DGS(

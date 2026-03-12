@@ -399,7 +399,7 @@ impl GaussianRenderer {
             log::debug!("created sort buffers for {:} points", pc.num_points());
             self.sorter_suff = Some(
                 self.sorter
-                    .create_sort_stuff(device, pc.num_points() as usize),
+                    .create_sort_stuff(device, pc.num_points() as usize, &self.draw_indirect_buffer),
             );
         }
 
@@ -438,21 +438,9 @@ impl GaussianRenderer {
             stopwatch.stop(encoder, "sorting").unwrap();
         }
 
-        // copy keys_size from sort uniform to draw_indirect instance_count
-        encoder.copy_buffer_to_buffer(
-            &self.sorter_suff.as_ref().unwrap().sorter_uni,
-            0,
-            &self.draw_indirect_buffer,
-            std::mem::size_of::<u32>() as u64,
-            std::mem::size_of::<u32>() as u64,
-        );
-        // DEBUG: also write a fixed instance count to test if queue.write_buffer works
-        // (queue.write_buffer executes BEFORE encoder commands, so the copy should overwrite this)
-        queue.write_buffer(
-            &self.draw_indirect_buffer,
-            4,
-            &77u32.to_le_bytes(),
-        );
+        // NOTE: instance_count is written directly by the preprocess shader
+        // via atomicAdd on draw_indirect.instance_count (binding 4 in group 2).
+        // copy_buffer_to_buffer from sorter_uni is broken on Metal/Apple Silicon.
     }
 
     pub fn render<'rpass>(

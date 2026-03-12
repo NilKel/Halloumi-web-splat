@@ -66,17 +66,12 @@ struct Splat {
     color_0: u32,color_1: u32,
 };
 
-// struct DrawIndirect {
-//     /// The number of vertices to draw.
-//     vertex_count: u32,
-//     /// The number of instances to draw.
-//     instance_count: atomic<u32>,
-//     /// The Index of the first vertex to draw.
-//     base_vertex: u32,
-//     /// The instance ID of the first instance to draw.
-//     /// Has to be 0, unless [`Features::INDIRECT_FIRST_INSTANCE`](crate::Features::INDIRECT_FIRST_INSTANCE) is enabled.
-//     base_instance: u32,
-// }
+struct DrawIndirect {
+    vertex_count: u32,
+    instance_count: atomic<u32>,
+    base_vertex: u32,
+    base_instance: u32,
+}
 
 struct DispatchIndirect {
     dispatch_x: atomic<u32>,
@@ -119,8 +114,6 @@ var<storage,read> geometries : array<GeometricInfo>;
 @group(1) @binding(4) 
 var<uniform> quantization : QuantizationUniforms;
 
-// @group(2) @binding(0) 
-// var<storage,read_write> indirect_draw_call : DrawIndirect;
 @group(2) @binding(0)
 var<storage, read_write> sort_infos: SortInfos;
 @group(2) @binding(1)
@@ -129,6 +122,8 @@ var<storage, read_write> sort_depths : array<u32>;
 var<storage, read_write> sort_indices : array<u32>;
 @group(2) @binding(3)
 var<storage, read_write> sort_dispatch: DispatchIndirect;
+@group(2) @binding(4)
+var<storage, read_write> draw_indirect: DrawIndirect;
 
 @group(3) @binding(0)
 var<uniform> render_settings: RenderSettings;
@@ -310,6 +305,7 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
     );
 
     let store_idx = atomicAdd(&sort_infos.keys_size, 1u);
+    atomicAdd(&draw_indirect.instance_count, 1u);
     let v = vec4<f32>(v1 / viewport, v2 / viewport);
     points_2d[store_idx] = Splat(
         pack2x16float(v.xy), pack2x16float(v.zw),

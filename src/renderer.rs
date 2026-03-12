@@ -11,7 +11,6 @@ use std::num::NonZeroU64;
 use std::time::Duration;
 
 use wgpu::{Extent3d, MultisampleState, include_wgsl};
-use wgpu::util::DeviceExt;
 
 use cgmath::{EuclideanSpace, Matrix4, Point3, SquareMatrix, Vector2, Vector4};
 
@@ -317,10 +316,6 @@ impl GaussianRenderer {
         &self.camera
     }
 
-    pub(crate) fn draw_indirect_buffer_ref(&self) -> &wgpu::Buffer {
-        &self.draw_indirect_buffer
-    }
-
     fn preprocess<'a>(
         &'a mut self,
         encoder: &'a mut wgpu::CommandEncoder,
@@ -336,41 +331,13 @@ impl GaussianRenderer {
         uniform.set_viewport(viewport.cast().unwrap());
         uniform.set_camera(camera);
 
-        // DEBUG: print camera state
-        log::info!("=== PREPROCESS DEBUG ===");
-        log::info!("  viewport: {}x{}", viewport.x, viewport.y);
-        log::info!("  focal: ({:.2}, {:.2})", focal.x, focal.y);
-        log::info!("  cam pos: ({:.3}, {:.3}, {:.3})", camera.position.x, camera.position.y, camera.position.z);
-        log::info!("  znear: {:.4}, zfar: {:.4}", camera.projection.znear, camera.projection.zfar);
-        log::info!("  fovx: {:.4}, fovy: {:.4}", camera.projection.fovx.0, camera.projection.fovy.0);
-        log::info!("  is_2dgs: {}", self.is_2dgs);
-        log::info!("  num_points: {}", pc.num_points());
-        let bbox = pc.bbox();
-        log::info!("  bbox min: ({:.3}, {:.3}, {:.3})", bbox.min.x, bbox.min.y, bbox.min.z);
-        log::info!("  bbox max: ({:.3}, {:.3}, {:.3})", bbox.max.x, bbox.max.y, bbox.max.z);
-        let view = camera.view_matrix();
-        log::info!("  view[0]: ({:.4}, {:.4}, {:.4}, {:.4})", view[0][0], view[0][1], view[0][2], view[0][3]);
-        log::info!("  view[1]: ({:.4}, {:.4}, {:.4}, {:.4})", view[1][0], view[1][1], view[1][2], view[1][3]);
-        log::info!("  view[2]: ({:.4}, {:.4}, {:.4}, {:.4})", view[2][0], view[2][1], view[2][2], view[2][3]);
-        log::info!("  view[3]: ({:.4}, {:.4}, {:.4}, {:.4})", view[3][0], view[3][1], view[3][2], view[3][3]);
-        let proj = camera.proj_matrix();
-        log::info!("  proj[0]: ({:.4}, {:.4}, {:.4}, {:.4})", proj[0][0], proj[0][1], proj[0][2], proj[0][3]);
-        log::info!("  proj[1]: ({:.4}, {:.4}, {:.4}, {:.4})", proj[1][0], proj[1][1], proj[1][2], proj[1][3]);
-        log::info!("  proj[2]: ({:.4}, {:.4}, {:.4}, {:.4})", proj[2][0], proj[2][1], proj[2][2], proj[2][3]);
-        log::info!("  proj[3]: ({:.4}, {:.4}, {:.4}, {:.4})", proj[3][0], proj[3][1], proj[3][2], proj[3][3]);
-
         self.camera.sync(queue);
 
         let settings_uniform = self.render_settings.as_mut();
         *settings_uniform = SplattingArgsUniform::from_args_and_pc(render_settings, pc);
-        log::info!("  clip_min: ({:.4}, {:.4}, {:.4})", settings_uniform.clipping_box_min.x, settings_uniform.clipping_box_min.y, settings_uniform.clipping_box_min.z);
-        log::info!("  clip_max: ({:.4}, {:.4}, {:.4})", settings_uniform.clipping_box_max.x, settings_uniform.clipping_box_max.y, settings_uniform.clipping_box_max.z);
-        log::info!("  gaussian_scaling: {:.4}", settings_uniform.gaussian_scaling);
-        log::info!("  max_sh_deg: {}", settings_uniform.max_sh_deg);
         self.render_settings.sync(queue);
 
         // TODO perform this in vertex buffer after draw call
-        // DEBUG: zero draw_indirect
         queue.write_buffer(
             &self.draw_indirect_buffer,
             0,
@@ -382,7 +349,14 @@ impl GaussianRenderer {
             }
             .as_bytes(),
         );
-        // Skip compute
+        let depth_buffer = &self.sorter_suff.as_ref().unwrap().sorter_bg_pre;
+        self.preprocess.run(
+            encoder,
+            pc,
+            &self.camera,
+            &self.render_settings,
+            depth_buffer,
+        );
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -429,12 +403,11 @@ impl GaussianRenderer {
             );
         }
 
-        // DEBUG: skip record_reset to avoid conflicting write to sorter_uni
-        // GPURSSorter::record_reset_indirect_buffer(
-        //     &self.sorter_suff.as_ref().unwrap().sorter_dis,
-        //     &self.sorter_suff.as_ref().unwrap().sorter_uni,
-        //     &queue,
-        // );
+        GPURSSorter::record_reset_indirect_buffer(
+            &self.sorter_suff.as_ref().unwrap().sorter_dis,
+            &self.sorter_suff.as_ref().unwrap().sorter_uni,
+            &queue,
+        );
 
         // convert 3D gaussian splats to 2D gaussian splats
         if let Some(stopwatch) = stopwatch {
@@ -450,16 +423,22 @@ impl GaussianRenderer {
         if let Some(stopwatch) = stopwatch {
             stopwatch.start(encoder, "sorting").unwrap();
         }
-        // DEBUG: sort disabled to test if preprocess produces visible points
-        // self.sorter.record_sort_indirect(
-        //     &self.sorter_suff.as_ref().unwrap().sorter_bg,
-        //     &self.sorter_suff.as_ref().unwrap().sorter_dis,
-        //     encoder,
-        // );
+        self.sorter.record_sort_indirect(
+            &self.sorter_suff.as_ref().unwrap().sorter_bg,
+            &self.sorter_suff.as_ref().unwrap().sorter_dis,
+            encoder,
+        );
         if let Some(stopwatch) = stopwatch {
             stopwatch.stop(encoder, "sorting").unwrap();
         }
 
+        encoder.copy_buffer_to_buffer(
+            &self.sorter_suff.as_ref().unwrap().sorter_uni,
+            0,
+            &self.draw_indirect_buffer,
+            std::mem::size_of::<u32>() as u64,
+            std::mem::size_of::<u32>() as u64,
+        );
     }
 
     pub fn render<'rpass>(

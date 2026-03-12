@@ -152,6 +152,7 @@ pub struct WindowContext {
     #[cfg(feature = "video")]
     cameras_save_path: String,
     stopwatch: Option<GPUStopwatch>,
+    needs_prepare: bool,
 }
 
 impl WindowContext {
@@ -300,6 +301,7 @@ impl WindowContext {
             scene_file_path: None,
 
             stopwatch,
+            needs_prepare: true,
         })
     }
 
@@ -318,6 +320,7 @@ impl WindowContext {
 
             self.set_scene(Scene::from_json(file)?);
         }
+        self.needs_prepare = true;
         Ok(())
     }
 
@@ -500,13 +503,6 @@ impl WindowContext {
         if let Some(ui_state) = ui_state {
             self.ui_renderer.cleanup(ui_state)
         }
-
-        // DEBUG: write 42 directly to draw_indirect via queue.write_buffer right before submit
-        self.wgpu_context.queue.write_buffer(
-            &self.renderer.draw_indirect_buffer_ref(),
-            4,
-            &42u32.to_le_bytes(),
-        );
 
         self.wgpu_context.queue.submit([encoder.finish()]);
 
@@ -842,7 +838,10 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
 
                 let resolution_change = state.splatting_args.viewport != Vector2::new(state.config.width, state.config.height);
 
-                let request_redraw = old_settings != state.splatting_args || resolution_change;
+                let request_redraw = old_settings != state.splatting_args || resolution_change || state.needs_prepare;
+                if request_redraw {
+                    state.needs_prepare = false;
+                }
 
                 if request_redraw || redraw_ui{
                     state.fps = (1. / dt.as_secs_f32()) * 0.05 + state.fps * 0.95;

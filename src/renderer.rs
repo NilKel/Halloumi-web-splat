@@ -403,6 +403,12 @@ impl GaussianRenderer {
             );
         }
 
+        log::info!("prepare() called: {} points, viewport {}x{}",
+            pc.num_points(),
+            render_settings.viewport.x,
+            render_settings.viewport.y,
+        );
+
         GPURSSorter::record_reset_indirect_buffer(
             &self.sorter_suff.as_ref().unwrap().sorter_dis,
             &self.sorter_suff.as_ref().unwrap().sorter_uni,

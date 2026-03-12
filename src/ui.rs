@@ -40,6 +40,8 @@ pub(crate) fn ui(state: &mut WindowContext) -> bool {
             .num_visible_points(&state.wgpu_context.device, &state.wgpu_context.queue),
     );
     #[cfg(not(target_arch = "wasm32"))]
+    log::info!("num_visible_points = {} / {}", num_drawn, state.pc.num_points());
+    #[cfg(not(target_arch = "wasm32"))]
     egui::Window::new("Render Stats")
         .default_width(200.)
         .default_height(100.)

@@ -337,17 +337,14 @@ impl GaussianRenderer {
         *settings_uniform = SplattingArgsUniform::from_args_and_pc(render_settings, pc);
         self.render_settings.sync(queue);
 
-        // TODO perform this in vertex buffer after draw call
-        queue.write_buffer(
+        // Zero draw_indirect via encoder command (not queue.write_buffer) to ensure
+        // proper synchronization with the compute shader's atomicAdd on Metal.
+        // vertex_count=4 is set via queue.write_buffer (no compute conflict on this field).
+        queue.write_buffer(&self.draw_indirect_buffer, 0, &4u32.to_le_bytes());
+        encoder.clear_buffer(
             &self.draw_indirect_buffer,
-            0,
-            wgpu::util::DrawIndirectArgs {
-                vertex_count: 4,
-                instance_count: 0,
-                first_vertex: 0,
-                first_instance: 0,
-            }
-            .as_bytes(),
+            4,
+            Some(NonZeroU64::new(12).unwrap()),
         );
         let depth_buffer = &self.sorter_suff.as_ref().unwrap().sorter_bg_pre;
         self.preprocess.run(

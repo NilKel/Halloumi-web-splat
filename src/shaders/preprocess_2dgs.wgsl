@@ -474,24 +474,19 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
     // Store to output buffer
     let store_idx = atomicAdd(&sort_infos.keys_size, 1u);
 
-    // Store transmat as f32 for precision, rest as f16 pairs
+    // DEBUG: write hardcoded test data to verify compute→render buffer path
+    // Every visible Gaussian writes a 0.3-NDC quad at center (0,0)
     splats_2d[store_idx] = Splat2DGS(
-        Tu.x, Tu.y, Tu.z,
-        Tv.x, Tv.y, Tv.z,
-        Tw.x, Tw.y, Tw.z,
-        opacity,
-        // NDC center: x uses standard mapping, y uses WebGPU viewport convention
-        // WebGPU: pixel.x = (ndc.x+1)*W/2  →  ndc.x = 2*pixel.x/W - 1
-        // WebGPU: pixel.y = (1-ndc.y)*H/2   →  ndc.y = 1 - 2*pixel.y/H
-        pack2x16float(vec2<f32>(
-            p_center.x / viewport.x * 2.0 - 1.0,
-            1.0 - p_center.y / viewport.y * 2.0
-        )),
-        pack2x16float(h / viewport * 2.0),                // NDC extent (always positive)
-        pack2x16float(color.rg),
-        pack2x16float(vec2<f32>(color.b, shape)),
-        idx,  // original Gaussian index for texture lookup
-        0u,   // padding
+        0.0, 0.0, 0.0,  // Tu (unused in debug vertex shader)
+        0.0, 0.0, 0.0,  // Tv
+        0.0, 0.0, 0.0,  // Tw
+        1.0,             // opacity = 1.0
+        0u,              // pos = pack2x16float(0.0, 0.0) = NDC center
+        pack2x16float(vec2<f32>(0.3, 0.3)),  // extent = 0.3 NDC each direction
+        pack2x16float(vec2<f32>(1.0, 0.0)),  // color R=1, G=0
+        pack2x16float(vec2<f32>(0.0, 0.0)),  // color B=0, shape=0
+        idx,
+        0u,
     );
 
     // Depth sorting

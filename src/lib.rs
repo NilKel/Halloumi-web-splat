@@ -440,16 +440,15 @@ impl WindowContext {
                     label: Some("render command encoder"),
                 });
 
-        if redraw_scene {
-            self.renderer.prepare(
-                &mut encoder,
-                &self.wgpu_context.device,
-                &self.wgpu_context.queue,
-                &self.pc,
-                self.splatting_args,
-                (&mut self.stopwatch).into(),
-            );
-        }
+        // Always prepare + render to avoid stale/missing splat data on Metal
+        self.renderer.prepare(
+            &mut encoder,
+            &self.wgpu_context.device,
+            &self.wgpu_context.queue,
+            &self.pc,
+            self.splatting_args,
+            (&mut self.stopwatch).into(),
+        );
 
         let ui_state = shapes.map(|shapes| {
             self.ui_renderer.prepare(

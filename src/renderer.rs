@@ -377,15 +377,15 @@ impl GaussianRenderer {
             }
             .as_bytes(),
         );
-        // DEBUG: skip compute and copy entirely — just test CPU write + readback
-        // let depth_buffer = &self.sorter_suff.as_ref().unwrap().sorter_bg_pre;
-        // self.preprocess.run(
-        //     encoder,
-        //     pc,
-        //     &self.camera,
-        //     &self.render_settings,
-        //     depth_buffer,
-        // );
+        // DEBUG: compute re-enabled, copy still disabled — testing if compute interferes
+        let depth_buffer = &self.sorter_suff.as_ref().unwrap().sorter_bg_pre;
+        self.preprocess.run(
+            encoder,
+            pc,
+            &self.camera,
+            &self.render_settings,
+            depth_buffer,
+        );
     }
 
     #[cfg(not(target_arch = "wasm32"))]

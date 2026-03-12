@@ -155,10 +155,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     let s = vec2<f32>(p.x / p.z, p.y / p.z);
 
-    // DEBUG: visualize surfel UV coordinates — should show smooth red/green gradient
-    // u maps to red, v maps to green, centered at 0.5
-    return vec4<f32>(s.x * 0.25 + 0.5, s.y * 0.25 + 0.5, 0.2, 1.0);
-
     // Compute rho3d (surfel-space distance) and rho2d (screen-space low-pass filter)
     let rho3d = dot(s, s);
 

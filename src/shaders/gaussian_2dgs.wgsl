@@ -110,17 +110,27 @@ fn vs_main(
     out.Tv = vec3<f32>(splat.tv_x, splat.tv_y, splat.tv_z);
     out.Tw = vec3<f32>(splat.tw_x, splat.tw_y, splat.tw_z);
     out.opacity = splat.opacity;
-    out.base_color = vec3<f32>(1.0, 0.0, 0.0);  // solid red for debug
-    out.center_pix = v_center * vec2<f32>(camera.viewport.x, camera.viewport.y) * 0.5 + camera.viewport * 0.5;
+
+    // Unpack SH base color and shape
+    let rg = unpack2x16float(splat.color_rg);
+    let b_shape = unpack2x16float(splat.color_b_shape);
+    out.base_color = vec3<f32>(rg.x, rg.y, b_shape.x);
+    out.shape = b_shape.y;
+    out.gauss_id = splat.gauss_id;
+
+    // Convert NDC center to pixel coords for ray-disk intersection
+    // WebGPU viewport: position = (ndc + 1) / 2 * [W, H]
+    out.center_pix = (v_center + 1.0) * camera.viewport * 0.5;
+
+    // Read surfel world position for view direction
+    let surfel = surfels[splat.gauss_id];
+    out.gauss_xyz = vec3<f32>(surfel.x, surfel.y, surfel.z);
 
     return out;
 }
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    // DEBUG: solid red, premultiplied alpha
-    return vec4<f32>(1.0, 0.0, 0.0, 1.0);
-
     let pix = in.position.xy;
 
     let Tu = in.Tu;
@@ -212,10 +222,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let av1 = min(av0 + 1, i32(v0_px + v_span - 1.0));
 
         // Bilinear interpolation from atlas (3 channels, FP16 packed as u32)
-        // Atlas layout: [H, W, 3] as FP16 = [H, W, 3] f16 values
-        // Packed as u32: atlas_texture[idx] = pack2x16float(ch0, ch1)
-        // For 3 channels per pixel: 3 f16 = 1.5 u32 → 2 u32s per pixel (with 1 f16 waste)
-        // Actually stored as flat f16 array packed into u32: f16_index = (row * W + col) * 3 + ch
         let aw = i32(atlas_w);
         for (var ch = 0u; ch < 3u; ch++) {
             let c00 = read_atlas_f16(av0, au0, ch, aw);

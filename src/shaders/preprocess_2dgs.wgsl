@@ -229,216 +229,43 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
         normal = -normal;
     }
 
-    // Build splat2world matrix (3x4)
-    // splat2world = [L0, L1, p_orig] as column vectors
-    // Then T = transpose(splat2world) * world2ndc * ndc2pix
-    let W = camera.proj[0][0]; // These are the full projection matrix entries
-    let H_val = viewport.y;
-    let W_val = viewport.x;
-
-    // We compute T = transpose(splat2world) * world2ndc * ndc2pix
-    // where world2ndc = proj * view (combined), ndc2pix maps NDC to pixel coords
+    // Compute transmat T = transpose(splat2world) * world2ndc * ndc2pix
+    // Tu, Tv, Tw are COLUMNS of T: pixel_homo = u*Tu + v*Tv + Tw
     //
-    // Following the CUDA implementation:
-    // world2ndc = projmatrix (already view*proj combined in our case? No, proj and view are separate)
+    // For surfel point: world_pos = p + u*L0 + v*L1
+    // clip = mvp * (world_pos, 1) = cp + u*cu + v*cv
     //
-    // Actually, the CUDA code uses projmatrix = proj * view (combined MVP).
-    // Let's combine them: MVP = proj * view
+    // WebGPU viewport: position = (ndc + 1) / 2 * [W, H]
+    //   pixel_x_homo = clip.x * W/2 + clip.w * W/2
+    //   pixel_y_homo = clip.y * H/2 + clip.w * H/2
+    //   w = clip.w
+    //
+    // camera.proj has VIEWPORT_Y_FLIP baked in (clip.y already negated),
+    // so pixel_y correctly increases downward matching @builtin(position).
     let mvp = camera.proj * camera.view;
-
-    // ndc2pix: maps NDC [-1,1] to pixel [0, W-1] x [0, H-1]
-    // ndc2pix is a 3x4 matrix:
-    // [W/2,  0,   0, (W-1)/2]
-    // [0,    H/2, 0, (H-1)/2]
-    // [0,    0,   0,  1     ]
-
-    // splat2world (3x4, columns are [L0, L1, p_orig]):
-    // Row 0: [L0.x, L1.x, 0, p.x]
-    // Row 1: [L0.y, L1.y, 0, p.y]
-    // Row 2: [L0.z, L1.z, 0, p.z]
-    // (with homogeneous row [0, 0, 0, 1])
-
-    // T = transpose(splat2world) * world2ndc * ndc2pix
-    // T is 3x3 where rows are Tu, Tv, Tw
-
-    // Build the combined matrix: world2ndc * ndc2pix
-    // world2ndc is 4x4 (mvp), ndc2pix is conceptually 3x4
-    // But we want T = splat2world^T * (mvp * ndc2pix)
-    // Let's compute it step by step following the CUDA code
-
-    // The CUDA code builds it as:
-    // T = transpose(splat2world) * world2ndc * ndc2pix
-    // where world2ndc is the GLM column-major proj matrix
-    // and ndc2pix maps from clip space to pixel space
-
-    // Let's do it directly:
-    // For each row of T (which becomes Tu, Tv, Tw):
-    // Tu = L0 dotted through the full transform chain
-    // Tv = L1 dotted through the full transform chain
-    // Tw = p_orig dotted through the full transform chain
-
-    // The combined transform from world to pixel is:
-    // p_pix = ndc2pix * (mvp * p_world)
-    // For a 3D point p, the projected pixel position is:
-    // clip = mvp * vec4(p, 1)
-    // ndc = clip.xyz / clip.w
-    // pix.x = (ndc.x + 1) * W/2 = ndc.x * W/2 + (W-1)/2...
-    // But actually ndc2pix includes the /w division implicitly through the matrix form
-
-    // Following the CUDA code exactly:
-    // The CUDA uses glm column-major matrices. Let me translate carefully.
-    //
-    // CUDA: world2ndc = glm::mat4(projmatrix[0..15]) where projmatrix = proj*view
-    // CUDA: ndc2pix = mat3x4(vec4(W/2,0,0,(W-1)/2), vec4(0,H/2,0,(H-1)/2), vec4(0,0,0,1))
-    // CUDA: T = transpose(splat2world) * world2ndc * ndc2pix
-    //
-    // But glm is column-major, so world2ndc * ndc2pix multiplies as:
-    // result[col] = world2ndc * ndc2pix[col]
-    // ndc2pix has 3 columns (it's 4x3 in glm notation, or 3x4 in row-major)
-    //
-    // Actually in the CUDA code, ndc2pix is mat3x4 which in GLM means 3 columns of vec4
-    // So ndc2pix * point would give a vec3 result
-    // And world2ndc * ndc2pix would be mat3x4 (a 4x3 matrix, 3 columns of vec4)
-    //
-    // Then T = transpose(splat2world) * (world2ndc * ndc2pix)
-    // splat2world is mat3x4 (3 columns of vec4), so transpose is mat4x3 (4 columns of vec3)
-    // So T = mat4x3 * mat4x3... hmm that doesn't work
-    //
-    // Let me re-read the CUDA code more carefully:
-    // splat2world is mat3x4: 3 columns of vec4
-    //   col0 = vec4(L[0], 0)
-    //   col1 = vec4(L[1], 0)
-    //   col2 = vec4(p, 1)
-    // This represents a 4x3 matrix (4 rows, 3 cols) in math notation
-    //
-    // world2ndc is mat4 (4x4)
-    // ndc2pix is mat3x4: 3 columns of vec4
-    //   = 4x3 matrix
-    //
-    // world2ndc * ndc2pix: mat4 * mat3x4
-    // In GLM: mat4 * mat3x4 = mat3x4 (3 columns, each = mat4 * vec4)
-    //
-    // transpose(splat2world) * (world2ndc * ndc2pix):
-    // transpose of mat3x4 is... in GLM, transpose(mat3x4) should give mat4x3
-    // mat4x3 has 4 rows, 3 cols
-    // But wait: GLM mat3x4 has 3 columns of 4 components
-    // So splat2world^T should be a matrix with rows = former columns
-    // In GLM: glm::transpose(mat<3,4>) = mat<4,3> (4 columns of 3 components)
-    //
-    // So T = mat4x3^T... no wait.
-    // T = transpose(splat2world) * M where M = world2ndc * ndc2pix (mat3x4, 3 cols of vec4)
-    // transpose(splat2world) is mat4x3 (4 cols of vec3)
-    // mat4x3 * mat3x4... hmm dimensions don't match for standard matrix multiply
-    //
-    // Actually I think the CUDA code computes this differently. Let me look again:
-    // T = glm::transpose(splat2world) * world2ndc * ndc2pix;
-    //
-    // This is evaluated right-to-left in GLM:
-    // Step 1: temp = world2ndc * ndc2pix → mat4 * mat3x4 → mat3x4 (4x3 in math)
-    // Step 2: T = glm::transpose(splat2world) * temp → ? * mat3x4
-    //
-    // glm::transpose(mat3x4) = mat4x3 (per GLM convention)
-    // mat4x3 * mat3x4... in GLM, mat<C1, R> * mat<C2, C1> = mat<C2, R>
-    // mat4x3 has C=4 cols, R=3 rows
-    // mat3x4 has C=3 cols, R=4 rows
-    // So mat4x3 * mat3x4 = mat3x3. (3 cols of vec3)
-    //
-    // Wait no. In GLM, mat<C,R> means C columns, R rows per column.
-    // Multiplication: mat<C1,R1> * mat<C2,R2> requires R2 = C1
-    // Result is mat<C2, R1>
-    //
-    // transpose(splat2world) = transpose(mat<3,4>) = mat<4,3>
-    //   → 4 columns, 3 rows
-    // world2ndc * ndc2pix = mat<4,4> * mat<3,4> = mat<3,4>
-    //   → 3 columns, 4 rows
-    //
-    // T = mat<4,3> * mat<3,4>: R2=4, C1=4... hmm 4 != 4 → R2 must equal C1
-    // Actually mat<4,3> has 4 columns and 3 rows per column. So it's a 3x4 matrix (3 rows, 4 cols).
-    // mat<3,4> has 3 columns and 4 rows per column. So it's a 4x3 matrix (4 rows, 3 cols).
-    // Matrix multiply: (3x4) * (4x3) = 3x3. ✓
-    // In GLM terms: mat<4,3> * mat<3,4> → C1=4, R1=3, C2=3, R2=4. Need R2=C1 → 4=4 ✓
-    // Result: mat<C2, R1> = mat<3, 3>. ✓
-    //
-    // So T is mat3x3 (3 columns of vec3), which gives us Tu, Tv, Tw as rows.
-    // T[0] = column 0 = vec3, T[1] = column 1, T[2] = column 2
-    // But in the CUDA code, Tu = T[0], Tv = T[1], Tw = T[2] accessed as columns.
-
-    // OK let me just compute it directly in WGSL.
-    // I'll compute each element of the 3x3 T matrix.
-
-    // splat2world as a 4x3 matrix (rows are x,y,z,w; cols are u,v,w):
-    // [L0.x  L1.x  p.x]
-    // [L0.y  L1.y  p.y]
-    // [L0.z  L1.z  p.z]
-    // [0     0     1  ]
-
-    // Combined world-to-pixel transform M = mvp then ndc2pix:
-    // For a world point p, clip = mvp * vec4(p, 1)
-    // pixel.x = clip.x / clip.w * W/2 + (W-1)/2
-    // pixel.y = clip.y / clip.w * H/2 + (H-1)/2
-    // pixel.z = clip.w (for depth)
-    //
-    // But we need the linear (pre-division) version for the transmat computation.
-    // The transmat maps from surfel local coords (u, v, 1) to pixel homogeneous coords.
-    //
-    // T * [u, v, 1]^T = [pixel_x * w, pixel_y * w, w]
-    // where w = clip.w
-    //
-    // For surfel point: world_pos = p + u * L0 + v * L1
-    // clip = mvp * vec4(world_pos, 1) = mvp * vec4(p, 1) + u * mvp * vec4(L0, 0) + v * mvp * vec4(L1, 0)
-    //
-    // Let cp = mvp * vec4(p, 1)    → vec4
-    // Let cu = mvp * vec4(L0, 0)   → vec4
-    // Let cv = mvp * vec4(L1, 0)   → vec4
-    //
-    // clip = cp + u * cu + v * cv
-    //
-    // pixel_x_homo = clip.x * W/2 + clip.w * (W-1)/2
-    // pixel_y_homo = clip.y * H/2 + clip.w * (H-1)/2
-    // w = clip.w
-    //
-    // So:
-    // pixel_x_homo = (cp.x + u*cu.x + v*cv.x) * W/2 + (cp.w + u*cu.w + v*cv.w) * (W-1)/2
-    //              = u * (cu.x * W/2 + cu.w * (W-1)/2) + v * (cv.x * W/2 + cv.w * (W-1)/2) + (cp.x * W/2 + cp.w * (W-1)/2)
-    //
-    // This gives us T as:
-    // Tu = (cu.x * W/2 + cu.w * Wcx,  cu.y * H/2 + cu.w * Hcy,  cu.w)
-    // Tv = (cv.x * W/2 + cv.w * Wcx,  cv.y * H/2 + cv.w * Hcy,  cv.w)
-    // Tw = (cp.x * W/2 + cp.w * Wcx,  cp.y * H/2 + cp.w * Hcy,  cp.w)
-    // where Wcx = (W-1)/2, Hcy = (H-1)/2
 
     let cp = mvp * vec4<f32>(xyz, 1.0);
     let cu = mvp * vec4<f32>(L0, 0.0);
     let cv = mvp * vec4<f32>(L1, 0.0);
 
-    let half_w = W_val / 2.0;
-    let half_h = H_val / 2.0;
-    let cx = W_val / 2.0;
-    let cy = H_val / 2.0;
+    let half_w = viewport.x / 2.0;
+    let half_h = viewport.y / 2.0;
 
-    // Tu, Tv, Tw are ROWS of the pixel_homo mapping matrix, where pixel coords
-    // match @builtin(position) in the fragment shader.
-    //
-    // WebGPU viewport transform:
-    //   position.x = (ndc.x + 1) * W/2       → pixel_x_homo = clip.x * W/2 + clip.w * W/2
-    //   position.y = (1 - ndc.y) * H/2        → pixel_y_homo = -clip.y * H/2 + clip.w * H/2
-    //
-    // camera.proj includes VIEWPORT_Y_FLIP (negates clip.y), so the WebGPU viewport
-    // Y flip and the projection Y flip combine to give the correct screen position.
-    // But for the transmat we need pixel coords matching @builtin(position), hence -half_h.
+    // Tu, Tv, Tw: columns of the transmat
+    // ndc2pix uses +half_h (no additional Y flip — VIEWPORT_Y_FLIP is in proj)
     let Tu = vec3<f32>(
-        cu.x * half_w + cu.w * cx,
-        cu.y * (-half_h) + cu.w * cy,
+        cu.x * half_w + cu.w * half_w,
+        cu.y * half_h + cu.w * half_h,
         cu.w
     );
     let Tv = vec3<f32>(
-        cv.x * half_w + cv.w * cx,
-        cv.y * (-half_h) + cv.w * cy,
+        cv.x * half_w + cv.w * half_w,
+        cv.y * half_h + cv.w * half_h,
         cv.w
     );
     let Tw = vec3<f32>(
-        cp.x * half_w + cp.w * cx,
-        cp.y * (-half_h) + cp.w * cy,
+        cp.x * half_w + cp.w * half_w,
+        cp.y * half_h + cp.w * half_h,
         cp.w
     );
 
@@ -474,16 +301,18 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
     // Store to output buffer
     let store_idx = atomicAdd(&sort_infos.keys_size, 1u);
 
-    // DEBUG: use simple NDC projection (same as 3DGS) to test if data is valid
-    let ndc_pos = pos2d.xy / pos2d.w;
-    let ndc_ext = vec2<f32>(0.01, 0.01);  // small fixed extent in NDC
+    // Convert pixel-space AABB to NDC for vertex shader output
+    // WebGPU viewport: position = (ndc + 1) / 2 * [W, H]
+    // Inverse: ndc = position * 2 / [W, H] - 1
+    let ndc_center = p_center * 2.0 / viewport - 1.0;
+    let ndc_ext = h * 2.0 / viewport;
 
     splats_2d[store_idx] = Splat2DGS(
         Tu.x, Tu.y, Tu.z,
         Tv.x, Tv.y, Tv.z,
         Tw.x, Tw.y, Tw.z,
         opacity,
-        pack2x16float(ndc_pos),
+        pack2x16float(ndc_center),
         pack2x16float(ndc_ext),
         pack2x16float(vec2<f32>(color.x, color.y)),
         pack2x16float(vec2<f32>(color.z, shape)),

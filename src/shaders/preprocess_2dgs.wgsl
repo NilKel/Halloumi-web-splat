@@ -172,6 +172,19 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
         return;
     }
 
+    // DEBUG: Force first 100 surfels visible to test atomic/buffer machinery
+    if idx < 100u {
+        let store_idx = atomicAdd(&sort_infos.keys_size, 1u);
+        sort_depths[store_idx] = 1000u;
+        sort_indices[store_idx] = store_idx;
+        let keys_per_wg = 256u * 15u;
+        if (store_idx % keys_per_wg) == 0u {
+            atomicAdd(&sort_dispatch.dispatch_x, 1u);
+        }
+        return;
+    }
+    // END DEBUG
+
     let viewport = camera.viewport;
     let surfel = surfels[idx];
     let xyz = vec3<f32>(surfel.x, surfel.y, surfel.z);

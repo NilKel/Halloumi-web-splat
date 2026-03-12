@@ -378,13 +378,6 @@ impl GaussianRenderer {
             }
             .as_bytes(),
         );
-        // DEBUG: create a fresh test buffer with value 42, copy it to draw_indirect
-        let test_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("test buffer"),
-            contents: &42u32.to_le_bytes(),
-            usage: wgpu::BufferUsages::COPY_SRC,
-        });
-        encoder.copy_buffer_to_buffer(&test_buf, 0, &self.draw_indirect_buffer, 4, 4);
         // Skip compute
     }
 
@@ -463,14 +456,13 @@ impl GaussianRenderer {
             stopwatch.stop(encoder, "sorting").unwrap();
         }
 
-        // DEBUG: disabled — using test_buf copy instead
-        // encoder.copy_buffer_to_buffer(
-        //     &self.sorter_suff.as_ref().unwrap().sorter_uni,
-        //     0,
-        //     &self.draw_indirect_buffer,
-        //     std::mem::size_of::<u32>() as u64,
-        //     std::mem::size_of::<u32>() as u64,
-        // );
+        // DEBUG: create fresh buffer with 42, copy to draw_indirect via encoder
+        let test_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("test buffer"),
+            contents: &42u32.to_le_bytes(),
+            usage: wgpu::BufferUsages::COPY_SRC,
+        });
+        encoder.copy_buffer_to_buffer(&test_buf, 0, &self.draw_indirect_buffer, 4, 4);
     }
 
     pub fn render<'rpass>(

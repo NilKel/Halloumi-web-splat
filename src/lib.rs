@@ -171,8 +171,13 @@ impl WindowContext {
 
         let window = Arc::new(window);
 
+        let default_backends = if cfg!(target_os = "macos") {
+            wgpu::Backends::METAL
+        } else {
+            wgpu::Backends::PRIMARY
+        };
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::from_env().unwrap_or(wgpu::Backends::PRIMARY),
+            backends: wgpu::Backends::from_env().unwrap_or(default_backends),
             ..Default::default()
         });
 

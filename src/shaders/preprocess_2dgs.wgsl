@@ -474,8 +474,12 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
     // Store to output buffer
     let store_idx = atomicAdd(&sort_infos.keys_size, 1u);
 
-    // Convert AABB center/half-extents to NDC
-    let ndc_center = p_center / viewport * 2.0;
+    // Convert AABB center/half-extents from pixel coords to NDC
+    // Vertex shader output: screen_x = (ndc_x+1)*W/2, screen_y = (1-ndc_y)*H/2
+    let ndc_center = vec2<f32>(
+        p_center.x * 2.0 / viewport.x - 1.0,
+        1.0 - p_center.y * 2.0 / viewport.y
+    );
     let ndc_extent = h / viewport * 2.0;
 
     splats_2d[store_idx] = Splat2DGS(

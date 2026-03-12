@@ -241,9 +241,12 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
     let cu = mvp * vec4<f32>(L0, 0.0);
     let cv_clip = mvp * vec4<f32>(L1, 0.0);
 
-    let Tu = vec3<f32>(cu.x, cu.y, cu.w);
-    let Tv = vec3<f32>(cv_clip.x, cv_clip.y, cv_clip.w);
-    let Tw = vec3<f32>(cp.x, cp.y, cp.w);
+    // Tu, Tv, Tw are ROWS of the forward mapping matrix M (not columns).
+    // M maps (u, v, 1) -> (clip.x, clip.y, clip.w).
+    // CUDA stores T = transpose(M), and T[0..2] = columns of T = rows of M.
+    let Tu = vec3<f32>(cu.x, cv_clip.x, cp.x);
+    let Tv = vec3<f32>(cu.y, cv_clip.y, cp.y);
+    let Tw = vec3<f32>(cu.w, cv_clip.w, cp.w);
 
     // Compute AABB from transmat — result is in NDC space
     let cutoff = 4.0;

@@ -91,33 +91,34 @@ fn vs_main(
 ) -> VertexOutput {
     var out: VertexOutput;
 
-    // DEBUG: Only draw instance 0 as a fullscreen quad
-    // Pass splat data through opacity varying to test if buffer is readable
-    if in_instance_index > 0u {
-        out.position = vec4<f32>(0.0, 0.0, 0.0, 0.0);
-        return out;
-    }
+    // Bypass sort indices for now — read splat data directly
+    let splat = splats_2d[in_instance_index];
 
-    let splat = splats_2d[0];
+    // Unpack center and extent (in NDC)
+    let v_center = unpack2x16float(splat.pos);
+    let v_extent = unpack2x16float(splat.extent);
 
+    // Generate quad vertex: expand AABB
     let x = f32(in_vertex_index % 2u == 0u) * 2.0 - 1.0;
     let y = f32(in_vertex_index < 2u) * 2.0 - 1.0;
-    out.position = vec4<f32>(x, y, 0.0, 1.0);
 
-    // Encode: opacity > 0 means buffer was written by preprocess
+    let margin = 1.2;
+    let offset = vec2<f32>(x, y) * v_extent * margin;
+    out.position = vec4<f32>(v_center + offset, 0.0, 1.0);
+
+    out.Tu = vec3<f32>(splat.tu_x, splat.tu_y, splat.tu_z);
+    out.Tv = vec3<f32>(splat.tv_x, splat.tv_y, splat.tv_z);
+    out.Tw = vec3<f32>(splat.tw_x, splat.tw_y, splat.tw_z);
     out.opacity = splat.opacity;
-    // Also pass Tu.x via base_color.r to check transmat
-    out.base_color = vec3<f32>(splat.tu_x, splat.tu_y, splat.tu_z);
+    out.base_color = vec3<f32>(1.0, 0.0, 0.0);  // solid red for debug
+    out.center_pix = v_center * vec2<f32>(camera.viewport.x, camera.viewport.y) * 0.5 + camera.viewport * 0.5;
 
     return out;
 }
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    // GREEN = buffer has data (opacity > 0), RED = buffer is empty
-    if in.opacity > 0.0 || in.base_color.x != 0.0 {
-        return vec4<f32>(0.0, 1.0, 0.0, 1.0);
-    }
+    // DEBUG: solid red, premultiplied alpha
     return vec4<f32>(1.0, 0.0, 0.0, 1.0);
 
     let pix = in.position.xy;

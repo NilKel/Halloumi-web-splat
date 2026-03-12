@@ -24,6 +24,15 @@ struct Splat {
 
 @group(0) @binding(2)
 var<storage, read> points_2d : array<Splat>;
+
+struct SortInfos {
+    keys_size: u32,
+    padded_size: u32,
+    even_pass: u32,
+    odd_pass: u32,
+};
+@group(1) @binding(0)
+var<storage, read> sort_infos: SortInfos;
 @group(1) @binding(4)
 var<storage, read> indices : array<u32>;
 
@@ -33,6 +42,13 @@ fn vs_main(
     @builtin(instance_index) in_instance_index: u32
 ) -> VertexOutput {
     var out: VertexOutput;
+
+    // Cull instances beyond visible count (workaround for Metal which can't use draw_indirect)
+    let visible_count = sort_infos.keys_size;
+    if in_instance_index >= visible_count {
+        out.position = vec4<f32>(0.0, 0.0, 2.0, 1.0);
+        return out;
+    }
 
     let vertex = points_2d[indices[in_instance_index] + 0u];
 

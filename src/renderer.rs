@@ -341,19 +341,6 @@ impl GaussianRenderer {
         *settings_uniform = SplattingArgsUniform::from_args_and_pc(render_settings, pc);
         self.render_settings.sync(queue);
 
-        // Set vertex_count=4 for the indirect draw call.
-        // instance_count will be set by copy_count shader after preprocess + sort.
-        queue.write_buffer(
-            &self.draw_indirect_buffer,
-            0,
-            wgpu::util::DrawIndirectArgs {
-                vertex_count: 4,
-                instance_count: 0,
-                first_vertex: 0,
-                first_instance: 0,
-            }
-            .as_bytes(),
-        );
         let depth_buffer = &self.sorter_suff.as_ref().unwrap().sorter_bg_pre;
         self.preprocess.run(
             encoder,
@@ -368,16 +355,16 @@ impl GaussianRenderer {
     pub async fn num_visible_points(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> u32 {
         let n = {
             let (tx, rx) = futures_intrusive::channel::shared::oneshot_channel();
-
+            let sort_uni = &self.sorter_suff.as_ref().unwrap().sorter_uni;
             wgpu::util::DownloadBuffer::read_buffer(
                 device,
                 queue,
-                &self.draw_indirect_buffer.slice(..),
+                &sort_uni.slice(0..4),
                 move |b| {
                     let download = b.unwrap();
                     let data = download.as_ref();
-                    let num_points = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-                    tx.send(num_points).unwrap();
+                    let count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                    tx.send(count).unwrap();
                 },
             );
             device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
@@ -388,7 +375,7 @@ impl GaussianRenderer {
 
     pub fn prepare(
         &mut self,
-        _encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut wgpu::CommandEncoder,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         pc: &PointCloud,
@@ -413,66 +400,25 @@ impl GaussianRenderer {
             &queue,
         );
 
-        // Use a separate encoder for preprocess + sort, then submit and readback.
-        // Metal/Apple Silicon cannot write to INDIRECT buffers from compute shaders,
-        // so we must readback keys_size and write it via queue.write_buffer.
-        let mut prep_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("preprocess encoder"),
-        });
-
         if let Some(stopwatch) = stopwatch {
-            stopwatch.start(&mut prep_encoder, "preprocess").unwrap();
+            stopwatch.start(encoder, "preprocess").unwrap();
         }
-        self.preprocess(&mut prep_encoder, queue, &pc, render_settings);
+        self.preprocess(encoder, queue, &pc, render_settings);
         if let Some(stopwatch) = stopwatch {
-            stopwatch.stop(&mut prep_encoder, "preprocess").unwrap();
+            stopwatch.stop(encoder, "preprocess").unwrap();
         }
 
         if let Some(stopwatch) = stopwatch {
-            stopwatch.start(&mut prep_encoder, "sorting").unwrap();
+            stopwatch.start(encoder, "sorting").unwrap();
         }
         self.sorter.record_sort_indirect(
             &self.sorter_suff.as_ref().unwrap().sorter_bg,
             &self.sorter_suff.as_ref().unwrap().sorter_dis,
-            &mut prep_encoder,
+            encoder,
         );
         if let Some(stopwatch) = stopwatch {
-            stopwatch.stop(&mut prep_encoder, "sorting").unwrap();
+            stopwatch.stop(encoder, "sorting").unwrap();
         }
-
-        // Submit preprocess + sort
-        queue.submit([prep_encoder.finish()]);
-
-        // Blocking readback of keys_size from sorter_uni
-        let keys_size = {
-            let (tx, rx) = futures_intrusive::channel::shared::oneshot_channel();
-            let sort_uni = &self.sorter_suff.as_ref().unwrap().sorter_uni;
-            wgpu::util::DownloadBuffer::read_buffer(
-                device,
-                queue,
-                &sort_uni.slice(0..4),
-                move |b| {
-                    let data = b.unwrap();
-                    let count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-                    tx.send(count).unwrap();
-                },
-            );
-            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-            pollster::block_on(rx.receive()).unwrap()
-        };
-
-        // Write instance_count via queue.write_buffer (the only reliable way on Metal)
-        queue.write_buffer(
-            &self.draw_indirect_buffer,
-            0,
-            wgpu::util::DrawIndirectArgs {
-                vertex_count: 4,
-                instance_count: keys_size,
-                first_vertex: 0,
-                first_instance: 0,
-            }
-            .as_bytes(),
-        );
     }
 
     pub fn render<'rpass>(
@@ -494,7 +440,11 @@ impl GaussianRenderer {
         }
 
         render_pass.set_pipeline(&self.pipeline);
-        render_pass.draw_indirect(&self.draw_indirect_buffer, 0);
+        // Use draw() with num_points as instance count instead of draw_indirect().
+        // The vertex shader reads keys_size from sort_infos and culls excess instances.
+        // This avoids Metal/Apple Silicon bugs where compute shaders can't write to INDIRECT buffers.
+        let num_points = self.sorter_suff.as_ref().unwrap().num_points as u32;
+        render_pass.draw(0..4, 0..num_points);
     }
 
     pub fn bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {

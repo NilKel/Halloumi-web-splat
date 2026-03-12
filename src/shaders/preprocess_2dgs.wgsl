@@ -229,66 +229,47 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
         normal = -normal;
     }
 
-    // Compute transmat T = transpose(splat2world) * world2ndc * ndc2pix
-    // Tu, Tv, Tw are COLUMNS of T: pixel_homo = u*Tu + v*Tv + Tw
+    // Compute transmat in CLIP-HOMOGENEOUS space (no ndc2pix).
+    // Tu, Tv, Tw are columns of T: clip_homo = u*Tu + v*Tv + Tw
+    // where clip_homo = (clip.x, clip.y, clip.w) and NDC = clip.xy / clip.w
     //
-    // For surfel point: world_pos = p + u*L0 + v*L1
-    // clip = mvp * (world_pos, 1) = cp + u*cu + v*cv
-    //
-    // WebGPU viewport: position = (ndc + 1) / 2 * [W, H]
-    //   pixel_x_homo = clip.x * W/2 + clip.w * W/2
-    //   pixel_y_homo = clip.y * H/2 + clip.w * H/2
-    //   w = clip.w
-    //
-    // camera.proj has VIEWPORT_Y_FLIP baked in (clip.y already negated),
-    // so pixel_y correctly increases downward matching @builtin(position).
+    // The AABB computed from this transmat gives center/extent directly in NDC.
+    // The fragment shader converts @builtin(position) to NDC for ray-disk intersection.
     let mvp = camera.proj * camera.view;
 
     let cp = mvp * vec4<f32>(xyz, 1.0);
     let cu = mvp * vec4<f32>(L0, 0.0);
-    let cv = mvp * vec4<f32>(L1, 0.0);
+    let cv_clip = mvp * vec4<f32>(L1, 0.0);
 
-    let half_w = viewport.x / 2.0;
-    let half_h = viewport.y / 2.0;
+    let Tu = vec3<f32>(cu.x, cu.y, cu.w);
+    let Tv = vec3<f32>(cv_clip.x, cv_clip.y, cv_clip.w);
+    let Tw = vec3<f32>(cp.x, cp.y, cp.w);
 
-    // Tu, Tv, Tw: columns of the transmat
-    // ndc2pix uses +half_h (no additional Y flip — VIEWPORT_Y_FLIP is in proj)
-    let Tu = vec3<f32>(
-        cu.x * half_w + cu.w * half_w,
-        cu.y * half_h + cu.w * half_h,
-        cu.w
-    );
-    let Tv = vec3<f32>(
-        cv.x * half_w + cv.w * half_w,
-        cv.y * half_h + cv.w * half_h,
-        cv.w
-    );
-    let Tw = vec3<f32>(
-        cp.x * half_w + cp.w * half_w,
-        cp.y * half_h + cp.w * half_h,
-        cp.w
-    );
-
-    // Compute AABB from transmat
-    let cutoff = 4.0; // 4 sigma cutoff for Gaussian kernel
+    // Compute AABB from transmat — result is in NDC space
+    let cutoff = 4.0;
     let t = vec3<f32>(cutoff * cutoff, cutoff * cutoff, -1.0);
-    let T2_sq = Tw * Tw; // element-wise
+    let T2_sq = Tw * Tw;
     let d = dot(t, T2_sq);
     if d == 0.0 {
         return;
     }
     let f = (1.0 / d) * t;
 
-    let p_center = vec2<f32>(
+    let ndc_center = vec2<f32>(
         dot(f, Tu * Tw),
         dot(f, Tv * Tw)
     );
 
-    let h0 = p_center * p_center - vec2<f32>(
+    let h0 = ndc_center * ndc_center - vec2<f32>(
         dot(f, Tu * Tu),
         dot(f, Tv * Tv)
     );
-    let h = sqrt(max(vec2<f32>(1e-4, 1e-4), h0));
+    let ndc_ext = sqrt(max(vec2<f32>(1e-4, 1e-4), h0));
+
+    // Cull if AABB center is way off screen
+    if any(abs(ndc_center) > 1.5 + ndc_ext) {
+        return;
+    }
 
     // Evaluate SH for base color
     let camera_pos = camera.view_inv[3].xyz;
@@ -300,12 +281,6 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
 
     // Store to output buffer
     let store_idx = atomicAdd(&sort_infos.keys_size, 1u);
-
-    // Convert pixel-space AABB to NDC for vertex shader output
-    // WebGPU viewport: position = (ndc + 1) / 2 * [W, H]
-    // Inverse: ndc = position * 2 / [W, H] - 1
-    let ndc_center = p_center * 2.0 / viewport - 1.0;
-    let ndc_ext = h * 2.0 / viewport;
 
     splats_2d[store_idx] = Splat2DGS(
         Tu.x, Tu.y, Tu.z,

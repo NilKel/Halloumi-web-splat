@@ -47,7 +47,7 @@ struct VertexOutput {
     @location(2) @interpolate(flat) Tw: vec3<f32>,
     @location(3) @interpolate(flat) base_color: vec3<f32>,
     @location(4) @interpolate(flat) opacity: f32,
-    @location(5) @interpolate(flat) center_pix: vec2<f32>,
+    @location(5) @interpolate(flat) center_ndc: vec2<f32>,
     @location(6) @interpolate(flat) gauss_id: u32,
     @location(7) @interpolate(flat) gauss_xyz: vec3<f32>,
     @location(8) @interpolate(flat) shape: f32,
@@ -91,10 +91,17 @@ fn vs_main(
 ) -> VertexOutput {
     var out: VertexOutput;
 
-    // Bypass sort indices for now — read splat data directly
-    let splat = splats_2d[in_instance_index];
+    // Instance culling: only render visible splats (matching 3DGS pattern)
+    let visible_count = sort_infos.keys_size;
+    if in_instance_index >= visible_count {
+        out.position = vec4<f32>(0.0, 0.0, 2.0, 1.0);
+        return out;
+    }
 
-    // Unpack center and extent (in NDC)
+    // Read through sort indices (matching 3DGS pattern)
+    let splat = splats_2d[indices[in_instance_index]];
+
+    // Unpack center and extent (already in NDC from clip-space transmat)
     let v_center = unpack2x16float(splat.pos);
     let v_extent = unpack2x16float(splat.extent);
 
@@ -117,10 +124,7 @@ fn vs_main(
     out.base_color = vec3<f32>(rg.x, rg.y, b_shape.x);
     out.shape = b_shape.y;
     out.gauss_id = splat.gauss_id;
-
-    // Convert NDC center to pixel coords for ray-disk intersection
-    // WebGPU viewport: position = (ndc + 1) / 2 * [W, H]
-    out.center_pix = (v_center + 1.0) * camera.viewport * 0.5;
+    out.center_ndc = v_center;
 
     // Read surfel world position for view direction
     let surfel = surfels[splat.gauss_id];
@@ -131,15 +135,18 @@ fn vs_main(
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    let pix = in.position.xy;
+    // Convert fragment position from pixel to NDC
+    // WebGPU viewport: position = (ndc + 1) / 2 * viewport
+    // Inverse: ndc = position * 2 / viewport - 1
+    let frag_ndc = in.position.xy * 2.0 / camera.viewport - 1.0;
 
     let Tu = in.Tu;
     let Tv = in.Tv;
     let Tw = in.Tw;
 
-    // Ray-disk intersection
-    let k = pix.x * Tw - Tu;
-    let l = pix.y * Tw - Tv;
+    // Ray-disk intersection in NDC space
+    let k = frag_ndc.x * Tw - Tu;
+    let l = frag_ndc.y * Tw - Tv;
     let p = cross(k, l);
 
     if abs(p.z) < 1e-6 {
@@ -148,10 +155,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     let s = vec2<f32>(p.x / p.z, p.y / p.z);
 
-    // Compute rho3d and rho2d
+    // Compute rho3d (surfel-space distance) and rho2d (screen-space low-pass filter)
     let rho3d = dot(s, s);
-    let d = in.center_pix - pix;
-    let rho2d = FilterInvSquare * dot(d, d);
+
+    // rho2d: convert NDC distance to pixel distance for the low-pass filter
+    let d_ndc = in.center_ndc - frag_ndc;
+    let d_pix = d_ndc * camera.viewport * 0.5;
+    let rho2d = FilterInvSquare * dot(d_pix, d_pix);
+
     let rho = min(rho3d, rho2d);
 
     // Kernel evaluation
@@ -208,7 +219,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let v_span = atlas_rects[r_base + 3u];
 
         // Surfel s -> atlas pixel coords (texel-center convention)
-        // Inverse: tex_coord = (s + E) / (2*E) * span - 0.5
         let au = u0_px + (s.x + E) / (2.0 * E) * u_span - 0.5;
         let av = v0_px + (s.y + E) / (2.0 * E) * v_span - 0.5;
         let au_c = clamp(au, u0_px, u0_px + u_span - 1.001);
@@ -240,7 +250,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 }
 
 // Read a single FP16 value from the atlas texture buffer
-// Atlas is stored as flat [H * W * C] f16 values packed into u32 pairs
 fn read_atlas_f16(row: i32, col: i32, ch: u32, atlas_w: i32) -> f32 {
     let f16_index = u32(row * atlas_w + col) * 3u + ch;
     let u32_index = f16_index / 2u;

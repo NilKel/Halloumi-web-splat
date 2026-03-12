@@ -462,14 +462,15 @@ impl GaussianRenderer {
             stopwatch.stop(encoder, "sorting").unwrap();
         }
 
-        // DEBUG: disabled — testing CPU write + readback only
-        // encoder.copy_buffer_to_buffer(
-        //     &self.sorter_suff.as_ref().unwrap().sorter_uni,
-        //     0,
-        //     &self.draw_indirect_buffer,
-        //     std::mem::size_of::<u32>() as u64,
-        //     std::mem::size_of::<u32>() as u64,
-        // );
+        // DEBUG: copy re-enabled — will overwrite CPU's 42 with sorter_uni[0]
+        // If we read 100: compute atomics work. If 0: atomics broken on Metal.
+        encoder.copy_buffer_to_buffer(
+            &self.sorter_suff.as_ref().unwrap().sorter_uni,
+            0,
+            &self.draw_indirect_buffer,
+            std::mem::size_of::<u32>() as u64,
+            std::mem::size_of::<u32>() as u64,
+        );
     }
 
     pub fn render<'rpass>(

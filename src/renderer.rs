@@ -404,11 +404,11 @@ impl GaussianRenderer {
             log::debug!("created sort buffers for {:} points", pc.num_points());
             let mut sort_stuff = self.sorter
                 .create_sort_stuff(device, pc.num_points() as usize, &self.draw_indirect_buffer);
-            sort_stuff.copy_count_bg = self.copy_count.create_bind_group(
+            sort_stuff.copy_count_bg = Some(self.copy_count.create_bind_group(
                 device,
                 &sort_stuff.sorter_uni,
                 &self.draw_indirect_buffer,
-            );
+            ));
             self.sorter_suff = Some(sort_stuff);
         }
 

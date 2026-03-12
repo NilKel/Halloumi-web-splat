@@ -762,7 +762,8 @@ var<storage, read_write> draw_indirect: DrawIndirect;
 @compute @workgroup_size(1)
 fn main() {
     let count = atomicLoad(&sort_infos.keys_size);
-    atomicStore(&draw_indirect.instance_count, count);
+    // DEBUG: write 55 to verify this shader runs at all
+    atomicStore(&draw_indirect.instance_count, 55u);
 }
 "#
                 .into(),

@@ -135,10 +135,6 @@ fn vs_main(
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    // DEBUG: solid color to verify AABB positioning and aspect ratio
-    // Comment this out to enable ray-disk intersection
-    return vec4<f32>(in.base_color, 1.0) * 0.5;
-
     // Convert fragment position from pixel to NDC
     // WebGPU viewport: position = (ndc + 1) / 2 * viewport
     // Inverse: ndc = position * 2 / viewport - 1
@@ -158,6 +154,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     let s = vec2<f32>(p.x / p.z, p.y / p.z);
+
+    // DEBUG: visualize surfel UV coordinates — should show smooth red/green gradient
+    // u maps to red, v maps to green, centered at 0.5
+    return vec4<f32>(s.x * 0.25 + 0.5, s.y * 0.25 + 0.5, 0.2, 1.0);
 
     // Compute rho3d (surfel-space distance) and rho2d (screen-space low-pass filter)
     let rho3d = dot(s, s);

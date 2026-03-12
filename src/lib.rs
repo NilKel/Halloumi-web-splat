@@ -433,22 +433,34 @@ impl WindowContext {
         let view_srgb = output.texture.create_view(&Default::default());
         // do prepare stuff
 
+        // Submit 1: preprocess + sort (compute work)
+        {
+            let mut compute_encoder =
+                self.wgpu_context
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("compute command encoder"),
+                    });
+
+            self.renderer.prepare(
+                &mut compute_encoder,
+                &self.wgpu_context.device,
+                &self.wgpu_context.queue,
+                &self.pc,
+                self.splatting_args,
+                (&mut self.stopwatch).into(),
+            );
+
+            self.wgpu_context.queue.submit([compute_encoder.finish()]);
+        }
+
+        // Submit 2: render pass (uses splat data written by submit 1)
         let mut encoder =
             self.wgpu_context
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("render command encoder"),
                 });
-
-        // Always prepare + render to avoid stale/missing splat data on Metal
-        self.renderer.prepare(
-            &mut encoder,
-            &self.wgpu_context.device,
-            &self.wgpu_context.queue,
-            &self.pc,
-            self.splatting_args,
-            (&mut self.stopwatch).into(),
-        );
 
         let ui_state = shapes.map(|shapes| {
             self.ui_renderer.prepare(
@@ -464,11 +476,6 @@ impl WindowContext {
             )
         });
 
-        if let Some(stopwatch) = &mut self.stopwatch {
-            stopwatch.start(&mut encoder, "rasterization").unwrap();
-        }
-        // Always render splats (using last prepare()'s data if scene didn't change).
-        // Without this, frames where redraw_scene=false would show undefined surface content.
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("render pass"),
@@ -485,10 +492,6 @@ impl WindowContext {
             });
             self.renderer.render(&mut render_pass, &self.pc);
         }
-        if let Some(stopwatch) = &mut self.stopwatch {
-            stopwatch.stop(&mut encoder, "rasterization").unwrap();
-        }
-        self.stopwatch.as_mut().map(|s| s.end(&mut encoder));
 
         if let Some(state) = &ui_state {
             let mut render_pass = encoder

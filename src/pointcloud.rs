@@ -163,7 +163,7 @@ impl PointCloud {
         let splat_2d_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("2d splats buffer"),
             size: (pc.num_points * splat_size) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
 

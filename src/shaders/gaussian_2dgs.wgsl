@@ -1,12 +1,13 @@
 // 2DGS Surfel Rendering Shader
-// Uses eigenvector-based rendering (same as 3DGS) for projected 2DGS surfels.
-// The preprocess computes 2D covariance from surfel axes and eigendecomposes.
+// Eigenvector-based Gaussian splatting with optional atlas texture residual.
 
 const CUTOFF:f32 = 2.3539888583335364; // = sqrt(log(255))
 
-// Splat2DGS: 64 bytes. Eigenvectors stored in f32 fields:
+// Splat2DGS: 64 bytes. Layout:
 // tu_x, tu_y = v1 / viewport (eigenvector 1)
 // tu_z, tv_x = v2 / viewport (eigenvector 2)
+// tv_y, tv_z = B matrix col 0 (screen_pos → surfel UV)
+// tw_x, tw_y = B matrix col 1
 struct Splat2DGS {
     tu_x: f32, tu_y: f32, tu_z: f32,
     tv_x: f32, tv_y: f32, tv_z: f32,
@@ -24,6 +25,9 @@ struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) screen_pos: vec2<f32>,
     @location(1) color: vec4<f32>,
+    @location(2) @interpolate(flat) B_col0: vec2<f32>,
+    @location(3) @interpolate(flat) B_col1: vec2<f32>,
+    @location(4) @interpolate(flat) gauss_id: u32,
 };
 
 struct SortInfos {
@@ -31,6 +35,13 @@ struct SortInfos {
     padded_size: u32,
     even_pass: u32,
     odd_pass: u32,
+};
+
+struct TexParams {
+    atlas_width: u32,
+    atlas_height: u32,
+    kernel_type: u32,
+    uv_extent_bits: u32,
 };
 
 // Group 0: splat_2d buffer (binding 2)
@@ -42,6 +53,14 @@ var<storage, read> splats_2d: array<Splat2DGS>;
 var<storage, read> sort_infos: SortInfos;
 @group(1) @binding(4)
 var<storage, read> indices: array<u32>;
+
+// Group 3: atlas + params (bindings 0,1,3 used; binding 2 = camera unused)
+@group(3) @binding(0)
+var<storage, read> atlas_texture: array<u32>;
+@group(3) @binding(1)
+var<storage, read> atlas_rects: array<f32>;
+@group(3) @binding(3)
+var<uniform> tex_params: TexParams;
 
 @vertex
 fn vs_main(
@@ -77,6 +96,11 @@ fn vs_main(
     let ba = unpack2x16float(splat.color_b_shape);
     out.color = vec4<f32>(rg.x, rg.y, ba.x, splat.opacity);
 
+    // Pass B matrix and gauss_id for texture lookup
+    out.B_col0 = vec2<f32>(splat.tv_y, splat.tv_z);
+    out.B_col1 = vec2<f32>(splat.tw_x, splat.tw_y);
+    out.gauss_id = splat.gauss_id;
+
     return out;
 }
 
@@ -87,5 +111,61 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         discard;
     }
     let b = min(0.99, exp(-a) * in.color.a);
-    return vec4<f32>(in.color.rgb, 1.0) * b;
+
+    // Base SH color
+    var color = in.color.rgb;
+
+    // Atlas texture residual lookup
+    let atlas_w = tex_params.atlas_width;
+    if atlas_w > 0u {
+        let E = bitcast<f32>(tex_params.uv_extent_bits);
+
+        // Convert screen_pos to surfel UV via precomputed B matrix
+        let B = mat2x2<f32>(in.B_col0, in.B_col1);
+        let s = B * in.screen_pos;
+
+        // Map surfel UV [-E, +E] to atlas pixel coordinates
+        let gauss_id = in.gauss_id;
+        let r_base = gauss_id * 4u;
+        let u0_px  = atlas_rects[r_base + 0u];
+        let v0_px  = atlas_rects[r_base + 1u];
+        let u_span = atlas_rects[r_base + 2u];
+        let v_span = atlas_rects[r_base + 3u];
+
+        let au = u0_px + (s.x + E) / (2.0 * E) * u_span - 0.5;
+        let av = v0_px + (s.y + E) / (2.0 * E) * v_span - 0.5;
+        let au_c = clamp(au, u0_px, u0_px + u_span - 1.001);
+        let av_c = clamp(av, v0_px, v0_px + v_span - 1.001);
+
+        let au0 = i32(au_c);
+        let av0 = i32(av_c);
+        let fu = au_c - f32(au0);
+        let fv = av_c - f32(av0);
+        let au1 = min(au0 + 1, i32(u0_px + u_span - 1.0));
+        let av1 = min(av0 + 1, i32(v0_px + v_span - 1.0));
+
+        // Bilinear interpolation from atlas (3 channels, FP16 packed as u32)
+        let aw = i32(atlas_w);
+        for (var ch = 0u; ch < 3u; ch++) {
+            let c00 = read_atlas_f16(av0, au0, ch, aw);
+            let c10 = read_atlas_f16(av0, au1, ch, aw);
+            let c01 = read_atlas_f16(av1, au0, ch, aw);
+            let c11 = read_atlas_f16(av1, au1, ch, aw);
+            color[ch] += (1.0 - fu) * (1.0 - fv) * c00
+                       + fu * (1.0 - fv) * c10
+                       + (1.0 - fu) * fv * c01
+                       + fu * fv * c11;
+        }
+    }
+
+    // Premultiplied alpha output
+    return vec4<f32>(color, 1.0) * b;
+}
+
+// Read a single FP16 value from the atlas texture buffer
+fn read_atlas_f16(row: i32, col: i32, ch: u32, atlas_w: i32) -> f32 {
+    let f16_index = u32(row * atlas_w + col) * 3u + ch;
+    let u32_index = f16_index / 2u;
+    let component = f16_index % 2u;
+    return unpack2x16float(atlas_texture[u32_index])[component];
 }

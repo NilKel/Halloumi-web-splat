@@ -263,6 +263,24 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
 
     let v_center = pos2d.xyzw / pos2d.w;
 
+    // Compute screen_pos → surfel UV matrix (B = A⁻¹ * [v1, v2])
+    // A maps surfel (u,v) to pixel displacement: A = J_wp * [L0, L1]
+    // T = W * J = J_wp^T, so T^T = J_wp
+    let TT = transpose(T);
+    let a0 = (TT * L0).xy;  // pixel displacement of u-direction
+    let a1 = (TT * L1).xy;  // pixel displacement of v-direction
+    let det_A = a0.x * a1.y - a0.y * a1.x;
+    // B maps screen_pos to surfel (u,v) for texture lookup
+    var B = mat2x2<f32>(vec2<f32>(0.0), vec2<f32>(0.0));
+    if abs(det_A) > 1e-10 {
+        let inv_det = 1.0 / det_A;
+        let A_inv = mat2x2<f32>(
+            vec2<f32>(a1.y * inv_det, -a0.y * inv_det),
+            vec2<f32>(-a1.x * inv_det, a0.x * inv_det)
+        );
+        B = A_inv * mat2x2<f32>(v1, v2);
+    }
+
     // SH color
     let camera_pos = camera.view_inv[3].xyz;
     let dir = normalize(xyz - camera_pos);
@@ -274,14 +292,15 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
     // Store to output buffer
     let store_idx = atomicAdd(&sort_infos.keys_size, 1u);
 
-    // Pack eigenvectors into Splat2DGS fields:
+    // Pack into Splat2DGS fields:
     // tu_x, tu_y = v1 / viewport
     // tu_z, tv_x = v2 / viewport
+    // tv_y, tv_z, tw_x, tw_y = B matrix (screen_pos → surfel UV)
     let v_scaled = vec4<f32>(v1 / viewport, v2 / viewport);
     splats_2d[store_idx] = Splat2DGS(
         v_scaled.x, v_scaled.y, v_scaled.z,  // v1/viewport, v2.x/viewport
-        v_scaled.w, 0.0, 0.0,                // v2.y/viewport, unused, unused
-        0.0, 0.0, 0.0,                       // unused
+        v_scaled.w, B[0].x, B[0].y,          // v2.y/viewport, B col0
+        B[1].x, B[1].y, 0.0,                 // B col1, unused
         opacity,
         pack2x16float(v_center.xy),
         0u,

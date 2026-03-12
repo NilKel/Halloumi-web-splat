@@ -344,7 +344,7 @@ impl GaussianRenderer {
         encoder.clear_buffer(
             &self.draw_indirect_buffer,
             4,
-            Some(NonZeroU64::new(12).unwrap()),
+            Some(12),
         );
         let depth_buffer = &self.sorter_suff.as_ref().unwrap().sorter_bg_pre;
         self.preprocess.run(

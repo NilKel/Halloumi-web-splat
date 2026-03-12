@@ -91,10 +91,21 @@ fn vs_main(
 ) -> VertexOutput {
     var out: VertexOutput;
 
-    // DEBUG: fullscreen quad for ALL instances to test if render pipeline works
+    // DEBUG: no keys_size check, bypass sort indices, use splat data directly
+    let splat = splats_2d[in_instance_index];
+
+    // Unpack center and extent (in NDC)
+    let v_center = unpack2x16float(splat.pos);
+    let v_extent = unpack2x16float(splat.extent);
+
+    // Generate quad vertex: expand AABB
     let x = f32(in_vertex_index % 2u == 0u) * 2.0 - 1.0;
     let y = f32(in_vertex_index < 2u) * 2.0 - 1.0;
-    out.position = vec4<f32>(x, y, 0.0, 1.0);
+
+    let margin = 1.2;
+    let offset = vec2<f32>(x, y) * v_extent * margin;
+    out.position = vec4<f32>(v_center + offset, 0.0, 1.0);
+
     return out;
 }
 

@@ -461,7 +461,7 @@ impl WindowContext {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("render pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: self.display.texture(),
+                    view: &view_rgb,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(self.splatting_args.background_color),
@@ -476,14 +476,6 @@ impl WindowContext {
         if let Some(stopwatch) = &mut self.stopwatch {
             stopwatch.stop(&mut encoder, "rasterization").unwrap();
         }
-
-        self.display.render(
-            &mut encoder,
-            &view_rgb,
-            self.splatting_args.background_color,
-            self.renderer.camera(),
-            &self.renderer.render_settings(),
-        );
         self.stopwatch.as_mut().map(|s| s.end(&mut encoder));
 
         if let Some(state) = &ui_state {

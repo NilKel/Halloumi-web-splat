@@ -261,7 +261,6 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
     );
 
     let store_idx = atomicAdd(&sort_infos.keys_size, 1u);
-    atomicAdd(&draw_indirect.instance_count, 1u);
     let v = vec4<f32>(v1 / viewport, v2 / viewport);
     points_2d[store_idx] = Splat(
         pack2x16float(v.xy), pack2x16float(v.zw),

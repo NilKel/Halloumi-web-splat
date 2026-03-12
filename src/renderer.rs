@@ -41,6 +41,7 @@ pub struct GaussianRenderer {
 
     render_settings: UniformBuffer<SplattingArgsUniform>,
     preprocess: PreprocessPipeline,
+    copy_count: CopyCountPipeline,
 
     draw_indirect_buffer: wgpu::Buffer,
     #[allow(dead_code)]
@@ -293,10 +294,13 @@ impl GaussianRenderer {
             tex_params = Some(tp);
         }
 
+        let copy_count = CopyCountPipeline::new(device);
+
         GaussianRenderer {
             pipeline,
             camera,
             preprocess,
+            copy_count,
             draw_indirect_buffer,
             draw_indirect,
             color_format,
@@ -337,14 +341,18 @@ impl GaussianRenderer {
         *settings_uniform = SplattingArgsUniform::from_args_and_pc(render_settings, pc);
         self.render_settings.sync(queue);
 
-        // Zero draw_indirect via encoder command (not queue.write_buffer) to ensure
-        // proper synchronization with the compute shader's atomicAdd on Metal.
-        // vertex_count=4 is set via queue.write_buffer (no compute conflict on this field).
-        queue.write_buffer(&self.draw_indirect_buffer, 0, &4u32.to_le_bytes());
-        encoder.clear_buffer(
+        // Set vertex_count=4 for the indirect draw call.
+        // instance_count will be set by copy_count shader after preprocess + sort.
+        queue.write_buffer(
             &self.draw_indirect_buffer,
-            4,
-            Some(12),
+            0,
+            wgpu::util::DrawIndirectArgs {
+                vertex_count: 4,
+                instance_count: 0,
+                first_vertex: 0,
+                first_instance: 0,
+            }
+            .as_bytes(),
         );
         let depth_buffer = &self.sorter_suff.as_ref().unwrap().sorter_bg_pre;
         self.preprocess.run(
@@ -394,10 +402,14 @@ impl GaussianRenderer {
                 .is_some_and(|s| s.num_points != pc.num_points() as usize)
         {
             log::debug!("created sort buffers for {:} points", pc.num_points());
-            self.sorter_suff = Some(
-                self.sorter
-                    .create_sort_stuff(device, pc.num_points() as usize, &self.draw_indirect_buffer),
+            let mut sort_stuff = self.sorter
+                .create_sort_stuff(device, pc.num_points() as usize, &self.draw_indirect_buffer);
+            sort_stuff.copy_count_bg = self.copy_count.create_bind_group(
+                device,
+                &sort_stuff.sorter_uni,
+                &self.draw_indirect_buffer,
             );
+            self.sorter_suff = Some(sort_stuff);
         }
 
         log::info!("prepare() called: {} points, viewport {}x{}",
@@ -435,9 +447,12 @@ impl GaussianRenderer {
             stopwatch.stop(encoder, "sorting").unwrap();
         }
 
-        // NOTE: instance_count is written directly by the preprocess shader
-        // via atomicAdd on draw_indirect.instance_count (binding 4 in group 2).
-        // copy_buffer_to_buffer from sorter_uni is broken on Metal/Apple Silicon.
+        // Copy keys_size → instance_count via 1-thread compute shader.
+        // Workaround: copy_buffer_to_buffer and clear_buffer are broken on Metal.
+        self.copy_count.run(
+            encoder,
+            self.sorter_suff.as_ref().unwrap().copy_count_bg.as_ref().unwrap(),
+        );
     }
 
     pub fn render<'rpass>(
@@ -676,6 +691,129 @@ impl PreprocessPipeline {
 
         let wgs_x = (pc.num_points() as f32 / 256.0).ceil() as u32;
         pass.dispatch_workgroups(wgs_x, 1, 1);
+    }
+}
+
+/// Tiny 1-thread compute shader that copies sort_infos.keys_size to draw_indirect.instance_count.
+/// Workaround for Metal/Apple Silicon where copy_buffer_to_buffer and clear_buffer don't
+/// synchronize properly with compute shader writes to the same buffer.
+struct CopyCountPipeline {
+    pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+}
+
+impl CopyCountPipeline {
+    fn new(device: &wgpu::Device) -> Self {
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("copy count bind group layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("copy count pipeline layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("copy count shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                r#"
+struct SortInfos {
+    keys_size: atomic<u32>,
+    padded_size: u32,
+    even_pass: u32,
+    odd_pass: u32,
+}
+
+struct DrawIndirect {
+    vertex_count: u32,
+    instance_count: atomic<u32>,
+    base_vertex: u32,
+    base_instance: u32,
+}
+
+@group(0) @binding(0)
+var<storage, read_write> sort_infos: SortInfos;
+@group(0) @binding(1)
+var<storage, read_write> draw_indirect: DrawIndirect;
+
+@compute @workgroup_size(1)
+fn main() {
+    let count = atomicLoad(&sort_infos.keys_size);
+    atomicStore(&draw_indirect.instance_count, count);
+}
+"#
+                .into(),
+            ),
+        });
+
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("copy count pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        Self {
+            pipeline,
+            bind_group_layout,
+        }
+    }
+
+    fn create_bind_group(
+        &self,
+        device: &wgpu::Device,
+        sort_uni: &wgpu::Buffer,
+        draw_indirect: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("copy count bind group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: sort_uni.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: draw_indirect.as_entire_binding(),
+                },
+            ],
+        })
+    }
+
+    fn run(&self, encoder: &mut wgpu::CommandEncoder, bind_group: &wgpu::BindGroup) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("copy count compute pass"),
+            ..Default::default()
+        });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, bind_group, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
     }
 }
 

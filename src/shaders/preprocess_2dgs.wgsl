@@ -473,8 +473,6 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
 
     // Store to output buffer
     let store_idx = atomicAdd(&sort_infos.keys_size, 1u);
-    // Write instance_count directly (copy_buffer_to_buffer broken on Metal)
-    atomicAdd(&draw_indirect.instance_count, 1u);
 
     // Store transmat as f32 for precision, rest as f16 pairs
     splats_2d[store_idx] = Splat2DGS(

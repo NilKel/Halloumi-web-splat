@@ -353,9 +353,12 @@ impl GaussianRenderer {
 
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn num_visible_points(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> u32 {
+        let Some(suff) = self.sorter_suff.as_ref() else {
+            return 0;
+        };
         let n = {
             let (tx, rx) = futures_intrusive::channel::shared::oneshot_channel();
-            let sort_uni = &self.sorter_suff.as_ref().unwrap().sorter_uni;
+            let sort_uni = &suff.sorter_uni;
             wgpu::util::DownloadBuffer::read_buffer(
                 device,
                 queue,

@@ -388,7 +388,7 @@ impl GaussianRenderer {
 
     pub fn prepare(
         &mut self,
-        encoder: &mut wgpu::CommandEncoder,
+        _encoder: &mut wgpu::CommandEncoder,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         pc: &PointCloud,
@@ -402,21 +402,10 @@ impl GaussianRenderer {
                 .is_some_and(|s| s.num_points != pc.num_points() as usize)
         {
             log::debug!("created sort buffers for {:} points", pc.num_points());
-            let mut sort_stuff = self.sorter
+            let sort_stuff = self.sorter
                 .create_sort_stuff(device, pc.num_points() as usize, &self.draw_indirect_buffer);
-            sort_stuff.copy_count_bg = Some(self.copy_count.create_bind_group(
-                device,
-                &sort_stuff.sorter_uni,
-                &self.draw_indirect_buffer,
-            ));
             self.sorter_suff = Some(sort_stuff);
         }
-
-        log::info!("prepare() called: {} points, viewport {}x{}",
-            pc.num_points(),
-            render_settings.viewport.x,
-            render_settings.viewport.y,
-        );
 
         GPURSSorter::record_reset_indirect_buffer(
             &self.sorter_suff.as_ref().unwrap().sorter_dis,
@@ -424,34 +413,68 @@ impl GaussianRenderer {
             &queue,
         );
 
-        // convert 3D gaussian splats to 2D gaussian splats
+        // Use a separate encoder for preprocess + sort, then submit and readback.
+        // Metal/Apple Silicon cannot write to INDIRECT buffers from compute shaders,
+        // so we must readback keys_size and write it via queue.write_buffer.
+        let mut prep_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("preprocess encoder"),
+        });
+
         if let Some(stopwatch) = stopwatch {
-            stopwatch.start(encoder, "preprocess").unwrap();
+            stopwatch.start(&mut prep_encoder, "preprocess").unwrap();
+        }
+        self.preprocess(&mut prep_encoder, queue, &pc, render_settings);
+        if let Some(stopwatch) = stopwatch {
+            stopwatch.stop(&mut prep_encoder, "preprocess").unwrap();
         }
 
-        self.preprocess(encoder, queue, &pc, render_settings);
         if let Some(stopwatch) = stopwatch {
-            stopwatch.stop(encoder, "preprocess").unwrap();
-        }
-
-        // sort 2d splats
-        if let Some(stopwatch) = stopwatch {
-            stopwatch.start(encoder, "sorting").unwrap();
+            stopwatch.start(&mut prep_encoder, "sorting").unwrap();
         }
         self.sorter.record_sort_indirect(
             &self.sorter_suff.as_ref().unwrap().sorter_bg,
             &self.sorter_suff.as_ref().unwrap().sorter_dis,
-            encoder,
+            &mut prep_encoder,
         );
         if let Some(stopwatch) = stopwatch {
-            stopwatch.stop(encoder, "sorting").unwrap();
+            stopwatch.stop(&mut prep_encoder, "sorting").unwrap();
         }
 
-        // Copy keys_size → instance_count via 1-thread compute shader.
-        // Workaround: copy_buffer_to_buffer and clear_buffer are broken on Metal.
-        self.copy_count.run(
-            encoder,
-            self.sorter_suff.as_ref().unwrap().copy_count_bg.as_ref().unwrap(),
+        // Submit preprocess + sort
+        let sub_idx = queue.submit([prep_encoder.finish()]);
+
+        // Blocking readback of keys_size from sorter_uni
+        let keys_size = {
+            let (tx, rx) = futures_intrusive::channel::shared::oneshot_channel();
+            let sort_uni = &self.sorter_suff.as_ref().unwrap().sorter_uni;
+            wgpu::util::DownloadBuffer::read_buffer(
+                device,
+                queue,
+                &sort_uni.slice(0..4),
+                move |b| {
+                    let data = b.unwrap();
+                    let count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                    tx.send(count).unwrap();
+                },
+            );
+            device.poll(wgpu::PollType::Wait {
+                submission_index: Some(sub_idx),
+                timeout: None,
+            }).unwrap();
+            pollster::block_on(rx.receive()).unwrap()
+        };
+
+        // Write instance_count via queue.write_buffer (the only reliable way on Metal)
+        queue.write_buffer(
+            &self.draw_indirect_buffer,
+            0,
+            wgpu::util::DrawIndirectArgs {
+                vertex_count: 4,
+                instance_count: keys_size,
+                first_vertex: 0,
+                first_instance: 0,
+            }
+            .as_bytes(),
         );
     }
 

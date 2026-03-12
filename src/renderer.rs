@@ -445,15 +445,17 @@ impl GaussianRenderer {
         if let Some(stopwatch) = stopwatch {
             stopwatch.stop(encoder, "preprocess").unwrap();
         }
+
         // sort 2d splats
         if let Some(stopwatch) = stopwatch {
             stopwatch.start(encoder, "sorting").unwrap();
         }
-        self.sorter.record_sort_indirect(
-            &self.sorter_suff.as_ref().unwrap().sorter_bg,
-            &self.sorter_suff.as_ref().unwrap().sorter_dis,
-            encoder,
-        );
+        // DEBUG: sort disabled to test if preprocess produces visible points
+        // self.sorter.record_sort_indirect(
+        //     &self.sorter_suff.as_ref().unwrap().sorter_bg,
+        //     &self.sorter_suff.as_ref().unwrap().sorter_dis,
+        //     encoder,
+        // );
         if let Some(stopwatch) = stopwatch {
             stopwatch.stop(encoder, "sorting").unwrap();
         }

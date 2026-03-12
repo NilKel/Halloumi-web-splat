@@ -135,6 +135,10 @@ fn vs_main(
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    // DEBUG: solid color to verify AABB positioning and aspect ratio
+    // Comment this out to enable ray-disk intersection
+    return vec4<f32>(in.base_color, 1.0) * 0.5;
+
     // Convert fragment position from pixel to NDC
     // WebGPU viewport: position = (ndc + 1) / 2 * viewport
     // Inverse: ndc = position * 2 / viewport - 1

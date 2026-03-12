@@ -441,7 +441,7 @@ impl GaussianRenderer {
         }
 
         // Submit preprocess + sort
-        let sub_idx = queue.submit([prep_encoder.finish()]);
+        queue.submit([prep_encoder.finish()]);
 
         // Blocking readback of keys_size from sorter_uni
         let keys_size = {
@@ -457,10 +457,7 @@ impl GaussianRenderer {
                     tx.send(count).unwrap();
                 },
             );
-            device.poll(wgpu::PollType::Wait {
-                submission_index: Some(sub_idx),
-                timeout: None,
-            }).unwrap();
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
             pollster::block_on(rx.receive()).unwrap()
         };
 

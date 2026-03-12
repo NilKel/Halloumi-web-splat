@@ -155,49 +155,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     let s = vec2<f32>(p.x / p.z, p.y / p.z);
 
-    // Compute rho3d (surfel-space distance) and rho2d (screen-space low-pass filter)
+    // Simple Gaussian kernel — rho3d only, no rho2d or kernel types
     let rho3d = dot(s, s);
-
-    // rho2d: convert NDC distance to pixel distance for the low-pass filter
-    let d_ndc = in.center_ndc - frag_ndc;
-    let d_pix = d_ndc * camera.viewport * 0.5;
-    let rho2d = FilterInvSquare * dot(d_pix, d_pix);
-
-    let rho = min(rho3d, rho2d);
-
-    // Kernel evaluation
-    let opa = in.opacity;
-    let kernel_type = tex_params.kernel_type;
-    let shape_val = in.shape;
-    var alpha: f32;
-
-    if (kernel_type == 1u || kernel_type == 4u) {
-        let k_sq = select(1.0, 9.0, kernel_type == 4u);
-        if rho3d >= k_sq + 1e-6 {
-            discard;
-        }
-        let base = max(0.0, 1.0 - rho3d / k_sq);
-        let alpha_beta = pow(base, shape_val);
-        let alpha_lp = exp(-rho2d / 2.0);
-        alpha = min(0.99, opa * max(alpha_beta, alpha_lp));
-    } else if kernel_type == 2u {
-        let power = -0.5 * rho;
-        if power > 0.0 { discard; }
-        var G = exp(power);
-        if shape_val > 0.0 {
-            G = (1.0 + shape_val) * G / (1.0 + shape_val * G);
-        }
-        alpha = min(0.99, opa * G);
-    } else if kernel_type == 3u {
-        let power = -0.5 * pow(rho, shape_val * 0.5);
-        if power > 0.0 { discard; }
-        alpha = min(0.99, opa * exp(power));
-    } else {
-        let power = -0.5 * rho;
-        if power > 0.0 { discard; }
-        alpha = min(0.99, opa * exp(power));
-    }
-
+    let power = -0.5 * rho3d;
+    let alpha = min(0.99, in.opacity * exp(power));
     if alpha < 1.0 / 255.0 {
         discard;
     }

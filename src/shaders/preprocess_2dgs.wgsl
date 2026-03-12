@@ -172,6 +172,17 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
         return;
     }
 
+    // DEBUG: test if atomics + copy work on Metal
+    if idx == 0u {
+        let test_idx = atomicAdd(&sort_infos.keys_size, 1u);
+        sort_depths[test_idx] = 1000u;
+        sort_indices[test_idx] = 0u;
+        let keys_per_wg = 256u * 15u;
+        if (test_idx % keys_per_wg) == 0u {
+            atomicAdd(&sort_dispatch.dispatch_x, 1u);
+        }
+    }
+
     let viewport = camera.viewport;
     let surfel = surfels[idx];
     let xyz = vec3<f32>(surfel.x, surfel.y, surfel.z);

@@ -468,7 +468,9 @@ impl WindowContext {
         if let Some(stopwatch) = &mut self.stopwatch {
             stopwatch.start(&mut encoder, "rasterization").unwrap();
         }
-        if redraw_scene {
+        // Always render splats (using last prepare()'s data if scene didn't change).
+        // Without this, frames where redraw_scene=false would show undefined surface content.
+        {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("render pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {

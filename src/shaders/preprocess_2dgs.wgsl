@@ -474,17 +474,19 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
     // Store to output buffer
     let store_idx = atomicAdd(&sort_infos.keys_size, 1u);
 
-    // DEBUG: write hardcoded test data to verify compute→render buffer path
-    // Every visible Gaussian writes a 0.3-NDC quad at center (0,0)
+    // Convert AABB center/half-extents to NDC
+    let ndc_center = p_center / viewport * 2.0;
+    let ndc_extent = h / viewport * 2.0;
+
     splats_2d[store_idx] = Splat2DGS(
-        0.0, 0.0, 0.0,  // Tu (unused in debug vertex shader)
-        0.0, 0.0, 0.0,  // Tv
-        0.0, 0.0, 0.0,  // Tw
-        1.0,             // opacity = 1.0
-        0u,              // pos = pack2x16float(0.0, 0.0) = NDC center
-        pack2x16float(vec2<f32>(0.3, 0.3)),  // extent = 0.3 NDC each direction
-        pack2x16float(vec2<f32>(1.0, 0.0)),  // color R=1, G=0
-        pack2x16float(vec2<f32>(0.0, 0.0)),  // color B=0, shape=0
+        Tu.x, Tu.y, Tu.z,
+        Tv.x, Tv.y, Tv.z,
+        Tw.x, Tw.y, Tw.z,
+        opacity,
+        pack2x16float(ndc_center),
+        pack2x16float(ndc_extent),
+        pack2x16float(vec2<f32>(color.x, color.y)),
+        pack2x16float(vec2<f32>(color.z, shape)),
         idx,
         0u,
     );

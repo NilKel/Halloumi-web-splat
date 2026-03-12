@@ -474,21 +474,17 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
     // Store to output buffer
     let store_idx = atomicAdd(&sort_infos.keys_size, 1u);
 
-    // Convert AABB center/half-extents from pixel coords to NDC
-    // Vertex shader output: screen_x = (ndc_x+1)*W/2, screen_y = (1-ndc_y)*H/2
-    let ndc_center = vec2<f32>(
-        p_center.x * 2.0 / viewport.x - 1.0,
-        1.0 - p_center.y * 2.0 / viewport.y
-    );
-    let ndc_extent = h / viewport * 2.0;
+    // DEBUG: use simple NDC projection (same as 3DGS) to test if data is valid
+    let ndc_pos = pos2d.xy / pos2d.w;
+    let ndc_ext = vec2<f32>(0.01, 0.01);  // small fixed extent in NDC
 
     splats_2d[store_idx] = Splat2DGS(
         Tu.x, Tu.y, Tu.z,
         Tv.x, Tv.y, Tv.z,
         Tw.x, Tw.y, Tw.z,
         opacity,
-        pack2x16float(ndc_center),
-        pack2x16float(ndc_extent),
+        pack2x16float(ndc_pos),
+        pack2x16float(ndc_ext),
         pack2x16float(vec2<f32>(color.x, color.y)),
         pack2x16float(vec2<f32>(color.z, shape)),
         idx,

@@ -430,11 +430,12 @@ impl GaussianRenderer {
             );
         }
 
-        GPURSSorter::record_reset_indirect_buffer(
-            &self.sorter_suff.as_ref().unwrap().sorter_dis,
-            &self.sorter_suff.as_ref().unwrap().sorter_uni,
-            &queue,
-        );
+        // DEBUG: skip record_reset to avoid conflicting write to sorter_uni
+        // GPURSSorter::record_reset_indirect_buffer(
+        //     &self.sorter_suff.as_ref().unwrap().sorter_dis,
+        //     &self.sorter_suff.as_ref().unwrap().sorter_uni,
+        //     &queue,
+        // );
 
         // convert 3D gaussian splats to 2D gaussian splats
         if let Some(stopwatch) = stopwatch {

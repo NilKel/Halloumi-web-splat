@@ -52,7 +52,7 @@ pub struct GaussianRenderer {
 
     is_2dgs: bool,
     // 2DGS-specific: bind group for textures+camera+params (group 3 in render shader)
-    tex_params: Option<UniformBuffer<TexParamsUniform>>,
+    pub(crate) tex_params: Option<UniformBuffer<TexParamsUniform>>,
     render_tex_bind_group: Option<wgpu::BindGroup>,
 }
 

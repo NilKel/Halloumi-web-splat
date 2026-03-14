@@ -155,6 +155,11 @@ pub(crate) fn ui(state: &mut WindowContext) -> bool {
                     );
                     ui.end_row();
                 }
+                if state.pc.atlas_width() > 0 {
+                    ui.label("Atlas Texture (A)");
+                    ui.checkbox(&mut state.atlas_enabled, "");
+                    ui.end_row();
+                }
             });
     });
 

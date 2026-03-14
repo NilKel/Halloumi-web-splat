@@ -147,6 +147,7 @@ pub struct WindowContext {
     display: Display,
 
     splatting_args: SplattingArgs,
+    atlas_enabled: bool,
 
     saved_cameras: Vec<SceneCamera>,
     #[cfg(feature = "video")]
@@ -310,6 +311,7 @@ impl WindowContext {
 
             stopwatch,
             needs_prepare: true,
+            atlas_enabled: true,
         })
     }
 
@@ -441,6 +443,13 @@ impl WindowContext {
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                         label: Some("compute command encoder"),
                     });
+
+            // Update atlas toggle before rendering
+            if let Some(ref mut tp) = self.renderer.tex_params {
+                let w = if self.atlas_enabled { self.pc.atlas_width() } else { 0 };
+                tp.as_mut().atlas_width = w;
+                tp.sync(&self.wgpu_context.queue);
+            }
 
             self.renderer.prepare(
                 &mut compute_encoder,
@@ -768,6 +777,10 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
                         }else{
                             state.stop_animation()
                         }
+                    }else if key == KeyCode::KeyA{
+                        state.atlas_enabled = !state.atlas_enabled;
+                        log::info!("Atlas texture: {}", if state.atlas_enabled { "enabled" } else { "disabled" });
+                        state.needs_prepare = true;
                     }else if key == KeyCode::KeyU{
                         state.ui_visible = !state.ui_visible;
                     }else if key == KeyCode::KeyC{

@@ -59,6 +59,7 @@ mod utils;
 pub struct RenderConfig {
     pub no_vsync: bool,
     pub hdr: bool,
+    pub compute_raster: bool,
 }
 
 pub struct WGPUContext {
@@ -316,7 +317,7 @@ impl WindowContext {
             stopwatch,
             needs_prepare: true,
             atlas_enabled: true,
-            compute_raster_enabled: false,
+            compute_raster_enabled: render_config.compute_raster,
             tile_raster: None,
         })
     }
@@ -771,6 +772,22 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
     let mut state = WindowContext::new(window, file, &config, atlas_path.as_ref(), atlas_bytes).await.unwrap();
     state.pointcloud_file_path = pointcloud_file_path;
 
+    if config.compute_raster {
+        let size = state.window.inner_size();
+        let mut tr = tile_raster::TileRasterPipeline::new(
+            &state.wgpu_context.device,
+            &state.wgpu_context.queue,
+            state.renderer.color_format(),
+            state.pc.sh_deg(),
+            state.renderer.sorter(),
+            state.pc.num_points(),
+            size.width,
+            size.height,
+        );
+        tr.update_splat_bind_group(&state.wgpu_context.device, &state.pc);
+        state.tile_raster = Some(tr);
+    }
+
     if let Some(scene) = scene {
         state.set_scene(scene);
         state.set_scene_camera(0);
@@ -986,6 +1003,7 @@ pub async fn run_wasm(
         RenderConfig {
             no_vsync: false,
             hdr: false,
+            compute_raster: false,
         },
         pc_file.and_then(|s| PathBuf::from_str(s.as_str()).ok()),
         scene_file.and_then(|s| PathBuf::from_str(s.as_str()).ok()),

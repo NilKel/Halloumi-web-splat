@@ -23,6 +23,10 @@ struct Opt {
     /// Atlas texture file (.natl) for 2DGS rendering
     #[arg(long)]
     atlas: Option<PathBuf>,
+
+    /// Start with compute tile rasterizer (toggle with G key)
+    #[arg(long, default_value_t = false)]
+    compute_raster: bool,
 }
 
 /// check if there is a scene file in the same directory or parent directory as the input file
@@ -64,6 +68,7 @@ async fn main() {
         RenderConfig {
             no_vsync: opt.no_vsync,
             hdr: opt.hdr,
+            compute_raster: opt.compute_raster,
         },
         Some(opt.input),
         opt.scene,

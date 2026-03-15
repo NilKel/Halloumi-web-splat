@@ -254,40 +254,10 @@ impl TileRasterPipeline {
             mapped_at_creation: false,
         });
 
-        // Tile sort buffers
-        let tile_entry_buf_size = (max_tile_entries.max(1) as u64) * 4;
-        let tile_keys_a = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("tile_keys_a"),
-            size: tile_entry_buf_size,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let tile_keys_b = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("tile_keys_b"),
-            size: tile_entry_buf_size,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let tile_payloads_a = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("tile_payloads_a"),
-            size: tile_entry_buf_size,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let tile_payloads_b = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("tile_payloads_b"),
-            size: tile_entry_buf_size,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
+        // Tile sort buffers — must use create_keyval_buffers for proper padding
+        // (radix sort requires buffers padded to count_ru_histo size)
+        let (tile_keys_a, tile_keys_b, tile_payloads_a, tile_payloads_b) =
+            GPURSSorter::create_keyval_buffers(device, max_tile_entries as usize, 4);
 
         let tile_sort_internal =
             sorter.create_internal_mem_buffer(device, max_tile_entries as usize);

@@ -160,6 +160,9 @@ pub(crate) fn ui(state: &mut WindowContext) -> bool {
                     ui.checkbox(&mut state.atlas_enabled, "");
                     ui.end_row();
                 }
+                ui.label("Compute Raster (G)");
+                ui.checkbox(&mut state.compute_raster_enabled, "");
+                ui.end_row();
             });
     });
 

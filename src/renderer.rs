@@ -320,6 +320,10 @@ impl GaussianRenderer {
         &self.camera
     }
 
+    pub(crate) fn sorter(&self) -> &GPURSSorter {
+        &self.sorter
+    }
+
     fn preprocess<'a>(
         &'a mut self,
         encoder: &'a mut wgpu::CommandEncoder,

@@ -497,6 +497,10 @@ impl PointCloud {
         self.uv_extent
     }
 
+    pub(crate) fn splat_2d_buffer(&self) -> &wgpu::Buffer {
+        &self.splat_2d_buffer
+    }
+
     pub(crate) fn atlas_buffer(&self) -> Option<&wgpu::Buffer> {
         self.atlas_buffer.as_ref()
     }

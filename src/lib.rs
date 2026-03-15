@@ -44,6 +44,8 @@ pub mod io;
 mod renderer;
 pub use renderer::{GaussianRenderer, SplattingArgs};
 
+mod tile_raster;
+
 mod scene;
 use crate::utils::GPUStopwatch;
 
@@ -148,6 +150,8 @@ pub struct WindowContext {
 
     splatting_args: SplattingArgs,
     atlas_enabled: bool,
+    compute_raster_enabled: bool,
+    tile_raster: Option<tile_raster::TileRasterPipeline>,
 
     saved_cameras: Vec<SceneCamera>,
     #[cfg(feature = "video")]
@@ -312,6 +316,8 @@ impl WindowContext {
             stopwatch,
             needs_prepare: true,
             atlas_enabled: true,
+            compute_raster_enabled: false,
+            tile_raster: None,
         })
     }
 
@@ -435,35 +441,59 @@ impl WindowContext {
         let view_srgb = output.texture.create_view(&Default::default());
         // do prepare stuff
 
-        // Submit 1: preprocess + sort (compute work)
-        {
-            let mut compute_encoder =
-                self.wgpu_context
-                    .device
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("compute command encoder"),
-                    });
+        if self.compute_raster_enabled {
+            // Compute raster path: tile preprocess + binning + tile raster + fullscreen copy
+            {
+                let mut compute_encoder =
+                    self.wgpu_context
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("compute raster encoder"),
+                        });
 
-            // Update atlas toggle before rendering
-            if let Some(ref mut tp) = self.renderer.tex_params {
-                let w = if self.atlas_enabled { self.pc.atlas_width() } else { 0 };
-                tp.as_mut().atlas_width = w;
-                tp.sync(&self.wgpu_context.queue);
+                if let Some(ref mut tr) = self.tile_raster {
+                    tr.prepare(
+                        &mut compute_encoder,
+                        &self.wgpu_context.queue,
+                        &self.pc,
+                        self.renderer.sorter(),
+                        self.splatting_args,
+                    );
+                }
+
+                self.wgpu_context.queue.submit([compute_encoder.finish()]);
             }
+        } else {
+            // Hardware raster path: preprocess + sort
+            {
+                let mut compute_encoder =
+                    self.wgpu_context
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("compute command encoder"),
+                        });
 
-            self.renderer.prepare(
-                &mut compute_encoder,
-                &self.wgpu_context.device,
-                &self.wgpu_context.queue,
-                &self.pc,
-                self.splatting_args,
-                &mut None,  // no stopwatch on compute encoder
-            );
+                // Update atlas toggle before rendering
+                if let Some(ref mut tp) = self.renderer.tex_params {
+                    let w = if self.atlas_enabled { self.pc.atlas_width() } else { 0 };
+                    tp.as_mut().atlas_width = w;
+                    tp.sync(&self.wgpu_context.queue);
+                }
 
-            self.wgpu_context.queue.submit([compute_encoder.finish()]);
+                self.renderer.prepare(
+                    &mut compute_encoder,
+                    &self.wgpu_context.device,
+                    &self.wgpu_context.queue,
+                    &self.pc,
+                    self.splatting_args,
+                    &mut None,
+                );
+
+                self.wgpu_context.queue.submit([compute_encoder.finish()]);
+            }
         }
 
-        // Submit 2: render pass (uses splat data written by submit 1)
+        // Submit 2: render pass
         let mut encoder =
             self.wgpu_context
                 .device
@@ -485,7 +515,26 @@ impl WindowContext {
             )
         });
 
-        {
+        if self.compute_raster_enabled {
+            // Fullscreen copy from compute output buffer
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("fullscreen copy pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view_rgb,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(self.splatting_args.background_color),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                ..Default::default()
+            });
+            if let Some(ref tr) = self.tile_raster {
+                tr.render(&mut render_pass);
+            }
+        } else {
+            // Hardware raster
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("render pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -777,6 +826,25 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
                         }else{
                             state.stop_animation()
                         }
+                    }else if key == KeyCode::KeyG{
+                        state.compute_raster_enabled = !state.compute_raster_enabled;
+                        log::info!("Compute raster: {}", if state.compute_raster_enabled { "enabled" } else { "disabled" });
+                        if state.compute_raster_enabled && state.tile_raster.is_none() {
+                            let size = state.window.inner_size();
+                            let mut tr = tile_raster::TileRasterPipeline::new(
+                                &state.wgpu_context.device,
+                                &state.wgpu_context.queue,
+                                state.renderer.color_format(),
+                                state.pc.sh_deg(),
+                                state.renderer.sorter(),
+                                state.pc.num_points(),
+                                size.width,
+                                size.height,
+                            );
+                            tr.update_splat_bind_group(&state.wgpu_context.device, &state.pc);
+                            state.tile_raster = Some(tr);
+                        }
+                        state.needs_prepare = true;
                     }else if key == KeyCode::KeyA{
                         state.atlas_enabled = !state.atlas_enabled;
                         log::info!("Atlas texture: {}", if state.atlas_enabled { "enabled" } else { "disabled" });

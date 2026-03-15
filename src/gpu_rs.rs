@@ -44,6 +44,7 @@ pub struct PointCloudSortStuff {
     pub(crate) sorter_render_bg: wgpu::BindGroup, // bind group only with the sorted indices for rendering
     pub(crate) sorter_bg_pre: wgpu::BindGroup, // bind group for the preprocess (is the sorter_dis and sorter_bg merged as we only have a limited amount of bgs for the preprocessing)
     pub(crate) copy_count_bg: Option<wgpu::BindGroup>, // bind group for copy-count compute shader
+    pub(crate) sort_indices_buffer: wgpu::Buffer, // sorted indices (payload_a) for compute rasterizer
 }
 
 #[allow(dead_code)]
@@ -177,6 +178,7 @@ impl GPURSSorter {
             sorter_render_bg,
             sorter_bg_pre,
             copy_count_bg: None,
+            sort_indices_buffer: sorter_p_a,
         }
     }
 

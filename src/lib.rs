@@ -443,15 +443,27 @@ impl WindowContext {
         // do prepare stuff
 
         if self.compute_raster_enabled {
-            // DEBUG: skip compute, CPU-write a known value to output_buf[0]
-            if let Some(ref tr) = self.tile_raster {
-                // Write 0xFF0000FF (red, RGBA8 packed) to first 4 bytes of output_buf
-                let red_pixel: u32 = 255 | (0 << 8) | (0 << 16) | (255 << 24);
-                self.wgpu_context.queue.write_buffer(
-                    tr.output_buf(),
-                    0,
-                    bytemuck::bytes_of(&red_pixel),
-                );
+            // Compute raster path
+            {
+                let compute_encoder =
+                    self.wgpu_context
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("compute raster encoder"),
+                        });
+
+                if let Some(ref mut tr) = self.tile_raster {
+                    drop(compute_encoder);
+                    tr.prepare_debug(
+                        &self.wgpu_context.device,
+                        &self.wgpu_context.queue,
+                        &self.pc,
+                        self.renderer.sorter(),
+                        self.splatting_args,
+                    );
+                } else {
+                    self.wgpu_context.queue.submit([compute_encoder.finish()]);
+                }
             }
         } else {
             // Hardware raster path: preprocess + sort

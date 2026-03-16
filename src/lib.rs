@@ -445,7 +445,7 @@ impl WindowContext {
         if self.compute_raster_enabled {
             // Compute raster path: tile preprocess + binning + tile raster + fullscreen copy
             {
-                let mut compute_encoder =
+                let compute_encoder =
                     self.wgpu_context
                         .device
                         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -453,16 +453,18 @@ impl WindowContext {
                         });
 
                 if let Some(ref mut tr) = self.tile_raster {
-                    tr.prepare(
-                        &mut compute_encoder,
+                    // Use debug mode: submit+poll after each pass to find hangs
+                    drop(compute_encoder); // not needed, prepare_debug creates its own
+                    tr.prepare_debug(
+                        &self.wgpu_context.device,
                         &self.wgpu_context.queue,
                         &self.pc,
                         self.renderer.sorter(),
                         self.splatting_args,
                     );
+                } else {
+                    self.wgpu_context.queue.submit([compute_encoder.finish()]);
                 }
-
-                self.wgpu_context.queue.submit([compute_encoder.finish()]);
             }
         } else {
             // Hardware raster path: preprocess + sort
@@ -783,6 +785,7 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
             state.pc.num_points(),
             size.width,
             size.height,
+            state.pc.is_2dgs(),
         );
         tr.update_splat_bind_group(&state.wgpu_context.device, &state.pc);
         state.tile_raster = Some(tr);
@@ -857,6 +860,7 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
                                 state.pc.num_points(),
                                 size.width,
                                 size.height,
+                                state.pc.is_2dgs(),
                             );
                             tr.update_splat_bind_group(&state.wgpu_context.device, &state.pc);
                             state.tile_raster = Some(tr);

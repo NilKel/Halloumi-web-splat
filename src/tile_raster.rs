@@ -145,6 +145,7 @@ impl TileRasterPipeline {
         num_points: u32,
         width: u32,
         height: u32,
+        is_2dgs: bool,
     ) -> Self {
         let tiles_x = (width + TILE_SIZE - 1) / TILE_SIZE;
         let tiles_y = (height + TILE_SIZE - 1) / TILE_SIZE;
@@ -593,12 +594,20 @@ impl TileRasterPipeline {
 
         // ========== Create pipelines ==========
 
-        // Preprocess tile pipeline
-        let preprocess_tile_shader_src = format!(
-            "const MAX_SH_DEG:u32 = {}u;\n{}",
-            sh_deg,
-            include_str!("shaders/preprocess_tile.wgsl")
-        );
+        // Preprocess tile pipeline (select 3DGS or 2DGS shader)
+        let preprocess_tile_shader_src = if is_2dgs {
+            format!(
+                "const MAX_SH_DEG:u32 = {}u;\n{}",
+                sh_deg,
+                include_str!("shaders/preprocess_tile_2dgs.wgsl")
+            )
+        } else {
+            format!(
+                "const MAX_SH_DEG:u32 = {}u;\n{}",
+                sh_deg,
+                include_str!("shaders/preprocess_tile.wgsl")
+            )
+        };
         let preprocess_tile_shader =
             device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("preprocess tile shader"),
@@ -711,12 +720,14 @@ impl TileRasterPipeline {
                 cache: None,
             });
 
-        // Tile raster pipeline
+        // Tile raster pipeline (select 3DGS or 2DGS shader)
         let tile_raster_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tile raster shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                include_str!("shaders/tile_raster.wgsl").into(),
-            ),
+            source: wgpu::ShaderSource::Wgsl(if is_2dgs {
+                include_str!("shaders/tile_raster_2dgs.wgsl").into()
+            } else {
+                include_str!("shaders/tile_raster.wgsl").into()
+            }),
         });
         let tile_raster_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("tile raster pipeline layout"),
@@ -950,6 +961,36 @@ impl TileRasterPipeline {
         sorter: &GPURSSorter,
         render_settings: SplattingArgs,
     ) {
+        self.prepare_inner(encoder, queue, pc, sorter, render_settings, None);
+    }
+
+    /// Debug version: submit + poll after each pass to find which one hangs.
+    /// Call with device = Some(&device) to enable per-pass sync.
+    pub fn prepare_debug(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pc: &PointCloud,
+        sorter: &GPURSSorter,
+        render_settings: SplattingArgs,
+    ) {
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("tile raster debug") });
+        self.prepare_inner(&mut encoder, queue, pc, sorter, render_settings, Some(device));
+        queue.submit(Some(encoder.finish()));
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        log::info!("[TILE DEBUG] All passes completed successfully");
+    }
+
+    fn prepare_inner(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        queue: &wgpu::Queue,
+        pc: &PointCloud,
+        sorter: &GPURSSorter,
+        render_settings: SplattingArgs,
+        debug_device: Option<&wgpu::Device>,
+    ) {
         let viewport = render_settings.viewport;
         let width = viewport.x;
         let height = viewport.y;
@@ -1031,6 +1072,24 @@ impl TileRasterPipeline {
         encoder.clear_buffer(&self.tile_ranges_buf, 0, None);
         encoder.clear_buffer(&self.tiles_touched_buf, 0, None);
 
+        // Debug sync helper: submit current encoder, poll, log, create new encoder
+        macro_rules! debug_sync {
+            ($label:expr, $encoder:ident, $debug_device:expr, $queue:expr) => {
+                if let Some(dev) = $debug_device {
+                    log::info!("[TILE DEBUG] submitting: {}", $label);
+                    let finished = std::mem::replace(
+                        $encoder,
+                        dev.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("tile raster debug"),
+                        }),
+                    );
+                    $queue.submit(Some(finished.finish()));
+                    dev.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+                    log::info!("[TILE DEBUG] completed: {}", $label);
+                }
+            };
+        }
+
         // ========== Pass 1: Tile preprocess ==========
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1045,6 +1104,7 @@ impl TileRasterPipeline {
             let wgs = (num_points as f32 / 256.0).ceil() as u32;
             pass.dispatch_workgroups(wgs, 1, 1);
         }
+        debug_sync!("preprocess", encoder, debug_device, queue);
 
         // ========== Pass 2: Prefix sum on tiles_touched ==========
         // Note: num_elements for prefix sum = num_visible (from preprocess).
@@ -1063,6 +1123,7 @@ impl TileRasterPipeline {
                 pass.set_bind_group(0, &self.prefix_sum_bg, &[]);
                 pass.dispatch_workgroups(wgs, 1, 1);
             }
+            debug_sync!("prefix_sum_reduce", encoder, debug_device, queue);
 
             // Scan blocks pass (single workgroup)
             {
@@ -1074,6 +1135,7 @@ impl TileRasterPipeline {
                 pass.set_bind_group(0, &self.prefix_sum_bg, &[]);
                 pass.dispatch_workgroups(1, 1, 1);
             }
+            debug_sync!("prefix_sum_scan_blocks", encoder, debug_device, queue);
 
             // Propagate pass
             {
@@ -1085,6 +1147,7 @@ impl TileRasterPipeline {
                 pass.set_bind_group(0, &self.prefix_sum_bg, &[]);
                 pass.dispatch_workgroups(wgs, 1, 1);
             }
+            debug_sync!("prefix_sum_propagate", encoder, debug_device, queue);
         }
 
         // ========== Pass 2.5: Update tile sort info ==========
@@ -1098,6 +1161,7 @@ impl TileRasterPipeline {
             pass.set_bind_group(0, &self.update_sort_info_bg, &[]);
             pass.dispatch_workgroups(1, 1, 1);
         }
+        debug_sync!("update_sort_info", encoder, debug_device, queue);
 
         // ========== Pass 3: Duplicate keys ==========
         {
@@ -1110,9 +1174,11 @@ impl TileRasterPipeline {
             let wgs = (num_points as f32 / 256.0).ceil() as u32;
             pass.dispatch_workgroups(wgs, 1, 1);
         }
+        debug_sync!("duplicate_keys", encoder, debug_device, queue);
 
         // ========== Pass 4: Radix sort tile keys ==========
         sorter.record_sort_indirect(&self.tile_sort_bg, &self.tile_sort_dis, encoder);
+        debug_sync!("radix_sort", encoder, debug_device, queue);
 
         // ========== Pass 5: Identify tile ranges ==========
         // We use indirect dispatch based on total entries from update_sort_info
@@ -1127,6 +1193,7 @@ impl TileRasterPipeline {
             let wgs = (self.max_tile_entries as f32 / 256.0).ceil() as u32;
             pass.dispatch_workgroups(wgs.max(1), 1, 1);
         }
+        debug_sync!("identify_ranges", encoder, debug_device, queue);
 
         // ========== Pass 6: Tile raster ==========
         // Note: tile_raster_bg must be set up via update_splat_bind_group() before first prepare()
@@ -1139,6 +1206,7 @@ impl TileRasterPipeline {
             pass.set_bind_group(0, &self.tile_raster_bg, &[]);
             pass.dispatch_workgroups(tiles_x, tiles_y, 1);
         }
+        debug_sync!("tile_raster", encoder, debug_device, queue);
     }
 
     pub fn render<'rpass>(&'rpass self, render_pass: &mut wgpu::RenderPass<'rpass>) {

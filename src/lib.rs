@@ -444,27 +444,12 @@ impl WindowContext {
 
         if self.compute_raster_enabled {
             // Compute raster path: tile preprocess + binning + tile raster + fullscreen copy
-            {
-                let compute_encoder =
-                    self.wgpu_context
-                        .device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("compute raster encoder"),
-                        });
-
-                if let Some(ref mut tr) = self.tile_raster {
-                    // Use debug mode: submit+poll after each pass to find hangs
-                    drop(compute_encoder); // not needed, prepare_debug creates its own
-                    tr.prepare_debug(
-                        &self.wgpu_context.device,
-                        &self.wgpu_context.queue,
-                        &self.pc,
-                        self.renderer.sorter(),
-                        self.splatting_args,
-                    );
-                } else {
-                    self.wgpu_context.queue.submit([compute_encoder.finish()]);
-                }
+            // TEMPORARILY skip compute passes to isolate render pipeline issues
+            log::info!("[COMPUTE RASTER] Skipping compute passes, testing fullscreen copy only");
+            if let Some(ref tr) = self.tile_raster {
+                log::info!("[COMPUTE RASTER] tile_raster is Some, color_format used at creation");
+            } else {
+                log::warn!("[COMPUTE RASTER] tile_raster is NONE!");
             }
         } else {
             // Hardware raster path: preprocess + sort
@@ -520,13 +505,14 @@ impl WindowContext {
 
         if self.compute_raster_enabled {
             // Fullscreen copy from compute output buffer
+            log::info!("[COMPUTE RASTER] Creating fullscreen copy render pass, surface format: {:?}", self.config.format);
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("fullscreen copy pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view_rgb,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(self.splatting_args.background_color),
+                        load: wgpu::LoadOp::Clear(wgpu::Color::GREEN),
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -534,7 +520,10 @@ impl WindowContext {
                 ..Default::default()
             });
             if let Some(ref tr) = self.tile_raster {
+                log::info!("[COMPUTE RASTER] Calling tr.render()");
                 tr.render(&mut render_pass);
+            } else {
+                log::warn!("[COMPUTE RASTER] tile_raster is NONE, skipping render");
             }
         } else {
             // Hardware raster

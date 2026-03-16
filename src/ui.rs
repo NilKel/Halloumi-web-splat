@@ -34,13 +34,15 @@ pub(crate) fn ui(state: &mut WindowContext) -> bool {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    let num_drawn = pollster::block_on(
-        state
-            .renderer
-            .num_visible_points(&state.wgpu_context.device, &state.wgpu_context.queue),
-    );
-    #[cfg(not(target_arch = "wasm32"))]
-    log::debug!("num_visible_points = {} / {}", num_drawn, state.pc.num_points());
+    let num_drawn = if state.compute_raster_enabled {
+        0 // Skip GPU readback stall in compute raster mode
+    } else {
+        pollster::block_on(
+            state
+                .renderer
+                .num_visible_points(&state.wgpu_context.device, &state.wgpu_context.queue),
+        )
+    };
     #[cfg(not(target_arch = "wasm32"))]
     egui::Window::new("Render Stats")
         .default_width(200.)

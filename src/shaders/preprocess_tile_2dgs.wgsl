@@ -259,7 +259,11 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>) {
     let s2w_r1 = vec4<f32>(L1, 0.0);
     let s2w_r2 = vec4<f32>(xyz, 1.0);
 
-    // world2ndc = P * V (no transpose — WGSL mat4x4 * mat4x4 gives the standard product)
+    // world2ndc = transpose(P * V) — matches CUDA's GLM reindexing convention.
+    // In CUDA, projmatrix stores (P*V)^T from PyTorch. GLM mat4 constructor reindexes
+    // this flat array into a column-major matrix whose columns are ROWS of P*V.
+    // So CUDA's world2ndc columns[j] = (PV)_row_j, meaning world2ndc = (PV)^T as a transform.
+    //
     // camera.proj includes VIEWPORT_Y_FLIP (diag(1,-1,1,1)) for WebGPU rendering.
     // Undo Y-flip by negating the y-component of each column (= negating row 1).
     var proj_raw = camera.proj;
@@ -267,10 +271,10 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>) {
     proj_raw[1].y = -proj_raw[1].y;
     proj_raw[2].y = -proj_raw[2].y;
     proj_raw[3].y = -proj_raw[3].y;
-    let M = proj_raw * camera.view;  // world2ndc = P*V, M[j] = column j
+    let M = transpose(proj_raw * camera.view);  // world2ndc = (PV)^T
 
     // Compute intermediate: I = transpose(s2w) * M  (3 rows × 4 cols, stored as 3 vec4 rows)
-    // I[i][j] = dot(s2w_row_i, M_col_j), and M[j] is column j in WGSL.
+    // I[i][j] = dot(s2w_row_i, M_col_j). M[j] = column j of (PV)^T = row j of PV.
     let I0 = vec4<f32>(dot(s2w_r0, M[0]), dot(s2w_r0, M[1]), dot(s2w_r0, M[2]), dot(s2w_r0, M[3]));
     let I1 = vec4<f32>(dot(s2w_r1, M[0]), dot(s2w_r1, M[1]), dot(s2w_r1, M[2]), dot(s2w_r1, M[3]));
     let I2 = vec4<f32>(dot(s2w_r2, M[0]), dot(s2w_r2, M[1]), dot(s2w_r2, M[2]), dot(s2w_r2, M[3]));

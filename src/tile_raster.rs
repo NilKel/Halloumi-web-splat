@@ -948,6 +948,10 @@ impl TileRasterPipeline {
         self.tile_size
     }
 
+    pub fn cached_size(&self) -> (u32, u32) {
+        (self.cached_width, self.cached_height)
+    }
+
     fn create_tile_raster_bg(
         device: &wgpu::Device,
         layout: &wgpu::BindGroupLayout,

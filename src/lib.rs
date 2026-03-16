@@ -453,9 +453,11 @@ impl WindowContext {
         // do prepare stuff
 
         if self.compute_raster_enabled {
-            // Recreate pipeline if kernel type or shared mem setting changed
+            // Recreate pipeline if settings changed or window resized
+            let current_size = self.window.inner_size();
             if let Some(ref tr) = self.tile_raster {
-                if tr.kernel_type() != self.kernel_type_override || tr.use_shared_mem() != self.use_shared_mem || tr.aabb_mode() != self.aabb_mode || tr.tile_size() != self.tile_size {
+                let (cw, ch) = tr.cached_size();
+                if tr.kernel_type() != self.kernel_type_override || tr.use_shared_mem() != self.use_shared_mem || tr.aabb_mode() != self.aabb_mode || tr.tile_size() != self.tile_size || cw != current_size.width || ch != current_size.height {
                     log::info!("Tile raster config changed, recreating pipeline");
                     let size = self.window.inner_size();
                     let mut new_tr = tile_raster::TileRasterPipeline::new(

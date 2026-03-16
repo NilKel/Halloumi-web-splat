@@ -134,6 +134,7 @@ pub struct TileRasterPipeline {
     cached_height: u32,
     cached_num_points: u32,
     max_tile_entries: u32,
+    kernel_type: u32,
 }
 
 impl TileRasterPipeline {
@@ -905,7 +906,12 @@ impl TileRasterPipeline {
             cached_height: height,
             cached_num_points: num_points,
             max_tile_entries,
+            kernel_type,
         }
+    }
+
+    pub fn kernel_type(&self) -> u32 {
+        self.kernel_type
     }
 
     fn create_tile_raster_bg(

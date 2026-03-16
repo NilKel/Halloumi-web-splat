@@ -167,6 +167,20 @@ pub(crate) fn ui(state: &mut WindowContext) -> bool {
                 ui.label("Compute Raster (G)");
                 ui.checkbox(&mut state.compute_raster_enabled, "");
                 ui.end_row();
+                if state.compute_raster_enabled {
+                    ui.label("Kernel Type");
+                    let kernel_names = ["Gaussian", "Beta", "Flex", "General", "BetaScaled"];
+                    let current = state.kernel_type_override as usize;
+                    let current_name = kernel_names.get(current).unwrap_or(&"Unknown");
+                    egui::ComboBox::from_id_salt("kernel_type")
+                        .selected_text(*current_name)
+                        .show_ui(ui, |ui| {
+                            for (i, name) in [(0u32, "Gaussian"), (4u32, "BetaScaled")] {
+                                ui.selectable_value(&mut state.kernel_type_override, i, name);
+                            }
+                        });
+                    ui.end_row();
+                }
             });
     });
 

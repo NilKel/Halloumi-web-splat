@@ -153,6 +153,7 @@ pub struct WindowContext {
     atlas_enabled: bool,
     compute_raster_enabled: bool,
     tile_raster: Option<tile_raster::TileRasterPipeline>,
+    pub(crate) kernel_type_override: u32, // current kernel type for compute raster
 
     saved_cameras: Vec<SceneCamera>,
     #[cfg(feature = "video")]
@@ -276,6 +277,8 @@ impl WindowContext {
             None
         };
 
+        let kernel_type_override = pc.kernel_type();
+
         Ok(Self {
             wgpu_context,
             scale_factor: window.scale_factor() as f32,
@@ -319,6 +322,7 @@ impl WindowContext {
             atlas_enabled: true,
             compute_raster_enabled: render_config.compute_raster,
             tile_raster: None,
+            kernel_type_override,
         })
     }
 
@@ -443,6 +447,28 @@ impl WindowContext {
         // do prepare stuff
 
         if self.compute_raster_enabled {
+            // Recreate pipeline if kernel type changed
+            if let Some(ref tr) = self.tile_raster {
+                if tr.kernel_type() != self.kernel_type_override {
+                    log::info!("Kernel type changed to {}, recreating pipeline", self.kernel_type_override);
+                    let size = self.window.inner_size();
+                    let mut new_tr = tile_raster::TileRasterPipeline::new(
+                        &self.wgpu_context.device,
+                        &self.wgpu_context.queue,
+                        self.renderer.color_format(),
+                        self.pc.sh_deg(),
+                        self.renderer.sorter(),
+                        self.pc.num_points(),
+                        size.width,
+                        size.height,
+                        self.pc.is_2dgs(),
+                        self.kernel_type_override,
+                    );
+                    new_tr.update_splat_bind_group(&self.wgpu_context.device, &self.pc);
+                    self.tile_raster = Some(new_tr);
+                }
+            }
+
             // Compute raster path
             let mut compute_encoder =
                 self.wgpu_context

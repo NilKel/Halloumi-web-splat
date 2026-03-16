@@ -136,6 +136,7 @@ pub struct TileRasterPipeline {
     max_tile_entries: u32,
     kernel_type: u32,
     use_shared_mem: bool,
+    aabb_mode: u32,
 }
 
 impl TileRasterPipeline {
@@ -151,6 +152,7 @@ impl TileRasterPipeline {
         is_2dgs: bool,
         kernel_type: u32,
         use_shared_mem: bool,
+        aabb_mode: u32,
     ) -> Self {
         let tiles_x = (width + TILE_SIZE - 1) / TILE_SIZE;
         let tiles_y = (height + TILE_SIZE - 1) / TILE_SIZE;
@@ -614,9 +616,10 @@ impl TileRasterPipeline {
         // Preprocess tile pipeline (select 3DGS or 2DGS shader)
         let preprocess_tile_shader_src = if is_2dgs {
             format!(
-                "const MAX_SH_DEG:u32 = {}u;\nconst KERNEL_TYPE: u32 = {}u;\n{}",
+                "const MAX_SH_DEG:u32 = {}u;\nconst KERNEL_TYPE: u32 = {}u;\nconst AABB_MODE: u32 = {}u;\n{}",
                 sh_deg,
                 kernel_type,
+                aabb_mode,
                 include_str!("shaders/preprocess_tile_2dgs.wgsl")
             )
         } else {
@@ -750,10 +753,12 @@ impl TileRasterPipeline {
         } else {
             include_str!("shaders/tile_raster.wgsl").to_string()
         };
-        log::info!("Tile raster kernel_type = {} ({}), shared_mem = {}",
+        log::info!("Tile raster kernel_type = {} ({}), shared_mem = {}, aabb_mode = {} ({})",
             kernel_type,
             match kernel_type { 0 => "Gaussian", 1 => "Beta", 4 => "BetaScaled", _ => "Unknown" },
-            use_shared_mem);
+            use_shared_mem,
+            aabb_mode,
+            match aabb_mode { 0 => "Square", 2 => "Rect", 3 => "Rect+AdR", _ => "Unknown" });
         let tile_raster_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tile raster shader"),
             source: wgpu::ShaderSource::Wgsl(tile_raster_shader_src.into()),
@@ -914,6 +919,7 @@ impl TileRasterPipeline {
             max_tile_entries,
             kernel_type,
             use_shared_mem,
+            aabb_mode,
         }
     }
 
@@ -923,6 +929,10 @@ impl TileRasterPipeline {
 
     pub fn use_shared_mem(&self) -> bool {
         self.use_shared_mem
+    }
+
+    pub fn aabb_mode(&self) -> u32 {
+        self.aabb_mode
     }
 
     fn create_tile_raster_bg(

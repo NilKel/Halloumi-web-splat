@@ -292,38 +292,52 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>) {
         vec3<f32>(dot(I0, np2), dot(I1, np2), dot(I2, np2)),  // column 2 = Tw
     );
 
-    // Compute adaptive cutoff radius based on kernel type (injected at compile time)
+    // Compute cutoff radius based on AABB_MODE (injected at compile time)
+    // AABB_MODE 0: Square AABB + fixed cutoff
+    // AABB_MODE 2: Rectangular AABB + fixed cutoff
+    // AABB_MODE 3: Rectangular AABB + AdR (opacity-adaptive) cutoff
     var cutoff: f32;
     if opacity < (1.0 / 255.0) {
         return;
     }
 
-    if KERNEL_TYPE == 4u {
-        // AdR for beta_scaled kernel: k²=9, k=3
-        let k_sq = 9.0;
-        let k = 3.0;
-        let ratio = 1.0 / (255.0 * opacity);
-        var r_beta = 0.0;
-        let threshold = pow(ratio, 1.0 / shape);
-        if threshold < 1.0 {
-            r_beta = k * sqrt(1.0 - threshold);
-        }
-        var r_lp = 0.0;
-        let log_term = log(255.0 * opacity);
-        if log_term > 0.0 {
-            r_lp = sqrt(2.0 * log_term);
-        }
-        cutoff = max(r_beta, r_lp);
-        cutoff = min(cutoff, k + 2.0);
-    } else {
-        // Gaussian kernel: cutoff = sqrt(-2 * ln(1/(255*opacity)))
-        let log_term = log(255.0 * opacity);
-        if log_term > 0.0 {
-            cutoff = sqrt(2.0 * log_term);
+    let use_adr = (AABB_MODE == 3u);
+
+    if use_adr {
+        // AdR: compute opacity-adaptive cutoff
+        if KERNEL_TYPE == 4u {
+            // BetaScaled kernel: k²=9, k=3
+            let k = 3.0;
+            let ratio = 1.0 / (255.0 * opacity);
+            var r_beta = 0.0;
+            let threshold = pow(ratio, 1.0 / shape);
+            if threshold < 1.0 {
+                r_beta = k * sqrt(1.0 - threshold);
+            }
+            var r_lp = 0.0;
+            let log_term = log(255.0 * opacity);
+            if log_term > 0.0 {
+                r_lp = sqrt(2.0 * log_term);
+            }
+            cutoff = max(r_beta, r_lp);
+            cutoff = min(cutoff, k + 2.0); // safety clamp to 5.0
         } else {
-            return;
+            // Gaussian kernel: solve opacity * exp(-r²/2) = 1/255
+            let log_term = log(255.0 * opacity);
+            if log_term > 0.0 {
+                cutoff = sqrt(2.0 * log_term);
+            } else {
+                return;
+            }
+            cutoff = min(cutoff, 3.5);
         }
-        cutoff = min(cutoff, 3.5); // conservative max for gaussian
+    } else {
+        // Fixed cutoff
+        if KERNEL_TYPE == 4u {
+            cutoff = 5.0; // k + 2 for BetaScaled (k=3)
+        } else {
+            cutoff = 3.5; // ~4σ for Gaussian
+        }
     }
 
     // Compute AABB from transmat
@@ -335,15 +349,30 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>) {
         return; // invalid AABB
     }
 
-    // Filter radius
+    // Compute tile bounding box
+    let use_rect = (AABB_MODE >= 2u);
     let filter_r = cutoff * FILTER_SIZE;
-    let radius = ceil(max(max(extent_pix.x, extent_pix.y), filter_r));
+    var rect_min_x: u32;
+    var rect_min_y: u32;
+    var rect_max_x: u32;
+    var rect_max_y: u32;
 
-    // Tile bounding box
-    let rect_min_x = max(0u, u32(max(0.0, floor((center_pix.x - radius) / f32(TILE_SIZE)))));
-    let rect_min_y = max(0u, u32(max(0.0, floor((center_pix.y - radius) / f32(TILE_SIZE)))));
-    let rect_max_x = min(tile_info.tiles_x, u32(ceil((center_pix.x + radius) / f32(TILE_SIZE))));
-    let rect_max_y = min(tile_info.tiles_y, u32(ceil((center_pix.y + radius) / f32(TILE_SIZE))));
+    if use_rect {
+        // Rectangular AABB: separate X and Y radii
+        let rx = ceil(max(extent_pix.x, filter_r));
+        let ry = ceil(max(extent_pix.y, filter_r));
+        rect_min_x = max(0u, u32(max(0.0, floor((center_pix.x - rx) / f32(TILE_SIZE)))));
+        rect_min_y = max(0u, u32(max(0.0, floor((center_pix.y - ry) / f32(TILE_SIZE)))));
+        rect_max_x = min(tile_info.tiles_x, u32(ceil((center_pix.x + rx) / f32(TILE_SIZE))));
+        rect_max_y = min(tile_info.tiles_y, u32(ceil((center_pix.y + ry) / f32(TILE_SIZE))));
+    } else {
+        // Square AABB: max(x, y) as scalar radius
+        let radius = ceil(max(max(extent_pix.x, extent_pix.y), filter_r));
+        rect_min_x = max(0u, u32(max(0.0, floor((center_pix.x - radius) / f32(TILE_SIZE)))));
+        rect_min_y = max(0u, u32(max(0.0, floor((center_pix.y - radius) / f32(TILE_SIZE)))));
+        rect_max_x = min(tile_info.tiles_x, u32(ceil((center_pix.x + radius) / f32(TILE_SIZE))));
+        rect_max_y = min(tile_info.tiles_y, u32(ceil((center_pix.y + radius) / f32(TILE_SIZE))));
+    }
 
     let n_tiles = (rect_max_x - rect_min_x) * (rect_max_y - rect_min_y);
     if n_tiles == 0u {

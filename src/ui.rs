@@ -180,6 +180,21 @@ pub(crate) fn ui(state: &mut WindowContext) -> bool {
                             }
                         });
                     ui.end_row();
+                    ui.label("AABB Mode");
+                    let aabb_name = match state.aabb_mode {
+                        0 => "Square",
+                        2 => "Rect",
+                        3 => "Rect+AdR",
+                        _ => "Unknown",
+                    };
+                    egui::ComboBox::from_id_salt("aabb_mode")
+                        .selected_text(aabb_name)
+                        .show_ui(ui, |ui| {
+                            for (val, name) in [(0u32, "Square"), (2u32, "Rect"), (3u32, "Rect+AdR")] {
+                                ui.selectable_value(&mut state.aabb_mode, val, name);
+                            }
+                        });
+                    ui.end_row();
                     ui.label("Shared Memory");
                     ui.checkbox(&mut state.use_shared_mem, "");
                     ui.end_row();

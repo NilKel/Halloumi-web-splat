@@ -159,7 +159,9 @@ impl TileRasterPipeline {
         let tiles_x = (width + tile_size - 1) / tile_size;
         let tiles_y = (height + tile_size - 1) / tile_size;
         let total_tiles = tiles_x * tiles_y;
-        let max_tile_entries = num_points * MAX_TILES_PER_GAUSSIAN;
+        // Scale max tiles per gaussian inversely with tile area (8×8 → 4x more tiles than 16×16)
+        let tiles_per_gaussian = MAX_TILES_PER_GAUSSIAN * (16 * 16) / (tile_size * tile_size);
+        let max_tile_entries = num_points * tiles_per_gaussian;
 
         // ========== Create uniforms ==========
         let tile_info = UniformBuffer::new(

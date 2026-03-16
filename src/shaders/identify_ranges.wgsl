@@ -2,6 +2,9 @@
 // After radix sort, tile_keys is sorted by (tile_id << 16 | depth).
 // This shader finds where each tile_id starts and ends in the sorted array.
 //
+// Uses a single-threaded serial scan to avoid race conditions on Metal
+// where concurrent writes to .x and .y of the same vec2<u32> can tear.
+//
 // Output: tile_ranges[tile_id] = vec2<u32>(start, end)
 
 struct SortInfos {
@@ -20,30 +23,24 @@ var<storage, read_write> tile_ranges: array<vec2<u32>>;  // (start, end) per til
 @group(0) @binding(2)
 var<storage, read> sort_infos: SortInfos;  // reads keys_size = actual total entries
 
-@compute @workgroup_size(256, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+@compute @workgroup_size(1, 1, 1)
+fn main() {
     let num_entries = sort_infos.keys_size;
-    if idx >= num_entries || num_entries == 0u {
+    if num_entries == 0u {
         return;
     }
 
-    let curr_tile = sorted_keys[idx] >> 16u;
+    var prev_tile = sorted_keys[0] >> 16u;
+    tile_ranges[prev_tile] = vec2<u32>(0u, 0u);
 
-    if idx == 0u {
-        // First element starts its tile
-        tile_ranges[curr_tile].x = 0u;
-    } else {
-        let prev_tile = sorted_keys[idx - 1u] >> 16u;
+    for (var i = 1u; i < num_entries; i++) {
+        let curr_tile = sorted_keys[i] >> 16u;
         if curr_tile != prev_tile {
-            // Tile boundary: end the previous tile, start the new one
-            tile_ranges[prev_tile].y = idx;
-            tile_ranges[curr_tile].x = idx;
+            tile_ranges[prev_tile].y = i;
+            tile_ranges[curr_tile].x = i;
+            prev_tile = curr_tile;
         }
     }
 
-    // Last element ends its tile
-    if idx == num_entries - 1u {
-        tile_ranges[curr_tile].y = num_entries;
-    }
+    tile_ranges[prev_tile].y = num_entries;
 }

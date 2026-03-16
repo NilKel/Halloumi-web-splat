@@ -1207,8 +1207,7 @@ impl TileRasterPipeline {
         debug_sync!("radix_sort", encoder, debug_device, queue);
 
         // ========== Pass 5: Identify tile ranges ==========
-        // We use indirect dispatch based on total entries from update_sort_info
-        // For simplicity, dispatch enough workgroups for max_tile_entries
+        // Serial single-threaded scan to avoid Metal vec2 write tearing
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("identify ranges"),
@@ -1216,8 +1215,7 @@ impl TileRasterPipeline {
             });
             pass.set_pipeline(&self.identify_ranges_pipeline);
             pass.set_bind_group(0, &self.identify_ranges_bg, &[]);
-            let wgs = (self.max_tile_entries as f32 / 256.0).ceil() as u32;
-            pass.dispatch_workgroups(wgs.max(1), 1, 1);
+            pass.dispatch_workgroups(1, 1, 1);
         }
         debug_sync!("identify_ranges", encoder, debug_device, queue);
 

@@ -247,34 +247,47 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>) {
     let L0 = R[0] * sx;  // u-direction in world space
     let L1 = R[1] * sy;  // v-direction in world space
 
-    // Compute transmat: T = transpose(splat2world) * world2ndc * ndc2pix
-    // splat2world is mat3x4 (3 cols of vec4): [L0|0, L1|0, center|1]
-    let s2w = mat3x4<f32>(
-        vec4<f32>(L0, 0.0),
-        vec4<f32>(L1, 0.0),
-        vec4<f32>(xyz, 1.0)
-    );
+    // Compute transmat: T = transpose(s2w) * world2ndc * ndc2pix
+    // Using explicit vec4 math to avoid mat3x4/mat4x3 types (naga/Metal compatibility).
+    //
+    // splat2world columns: c0 = (L0, 0), c1 = (L1, 0), c2 = (xyz, 1)
+    // transpose(s2w) has rows = s2w columns:
+    //   row0 = (L0.x, L0.y, L0.z, 0)
+    //   row1 = (L1.x, L1.y, L1.z, 0)
+    //   row2 = (xyz.x, xyz.y, xyz.z, 1)
+    let s2w_r0 = vec4<f32>(L0, 0.0);
+    let s2w_r1 = vec4<f32>(L1, 0.0);
+    let s2w_r2 = vec4<f32>(xyz, 1.0);
 
     // world2ndc = (proj * view)^T — matches CUDA GLM reindexing convention
     // camera.proj includes VIEWPORT_Y_FLIP (diag(1,-1,1,1)) for WebGPU rendering.
-    // For transmat computation we need the raw projection (no Y-flip).
     // Undo Y-flip by negating the y-component of each column.
     var proj_raw = camera.proj;
     proj_raw[0].y = -proj_raw[0].y;
     proj_raw[1].y = -proj_raw[1].y;
     proj_raw[2].y = -proj_raw[2].y;
     proj_raw[3].y = -proj_raw[3].y;
-    let world2ndc = transpose(proj_raw * camera.view);
+    let M = transpose(proj_raw * camera.view);  // world2ndc, 4x4
 
-    // ndc2pix: maps NDC to pixel coordinates (mat3x4 = 3 cols of vec4)
-    let ndc2pix = mat3x4<f32>(
-        vec4<f32>(W / 2.0, 0.0, 0.0, (W - 1.0) / 2.0),
-        vec4<f32>(0.0, H / 2.0, 0.0, (H - 1.0) / 2.0),
-        vec4<f32>(0.0, 0.0, 0.0, 1.0)
+    // Compute intermediate: I = transpose(s2w) * M  (3 rows × 4 cols, stored as 3 vec4 rows)
+    // I[i] = vec4(dot(s2w_ri, M_col0), dot(s2w_ri, M_col1), dot(s2w_ri, M_col2), dot(s2w_ri, M_col3))
+    // Since M = transpose(...), M[j] is column j.
+    let I0 = vec4<f32>(dot(s2w_r0, M[0]), dot(s2w_r0, M[1]), dot(s2w_r0, M[2]), dot(s2w_r0, M[3]));
+    let I1 = vec4<f32>(dot(s2w_r1, M[0]), dot(s2w_r1, M[1]), dot(s2w_r1, M[2]), dot(s2w_r1, M[3]));
+    let I2 = vec4<f32>(dot(s2w_r2, M[0]), dot(s2w_r2, M[1]), dot(s2w_r2, M[2]), dot(s2w_r2, M[3]));
+
+    // ndc2pix columns (as vec4): c0 = (W/2, 0, 0, (W-1)/2), c1 = (0, H/2, 0, (H-1)/2), c2 = (0, 0, 0, 1)
+    let np0 = vec4<f32>(W / 2.0, 0.0, 0.0, (W - 1.0) / 2.0);
+    let np1 = vec4<f32>(0.0, H / 2.0, 0.0, (H - 1.0) / 2.0);
+    let np2 = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+
+    // T = I * ndc2pix  (3×4 * 4×3 = 3×3)
+    // T[row][col] = dot(I_row, ndc2pix_col)
+    let T_mat = mat3x3<f32>(
+        vec3<f32>(dot(I0, np0), dot(I1, np0), dot(I2, np0)),  // column 0 = Tu
+        vec3<f32>(dot(I0, np1), dot(I1, np1), dot(I2, np1)),  // column 1 = Tv
+        vec3<f32>(dot(I0, np2), dot(I1, np2), dot(I2, np2)),  // column 2 = Tw
     );
-
-    // T = transpose(s2w) * world2ndc * ndc2pix = mat3x3
-    let T_mat = transpose(s2w) * world2ndc * ndc2pix;
 
     // AdR (Adaptive Radius) cutoff for beta_scaled kernel (kernel_type 4)
     // k²=9, k=3 for beta_scaled

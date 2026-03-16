@@ -135,6 +135,7 @@ pub struct TileRasterPipeline {
     cached_num_points: u32,
     max_tile_entries: u32,
     kernel_type: u32,
+    use_shared_mem: bool,
 }
 
 impl TileRasterPipeline {
@@ -149,6 +150,7 @@ impl TileRasterPipeline {
         height: u32,
         is_2dgs: bool,
         kernel_type: u32,
+        use_shared_mem: bool,
     ) -> Self {
         let tiles_x = (width + TILE_SIZE - 1) / TILE_SIZE;
         let tiles_y = (height + TILE_SIZE - 1) / TILE_SIZE;
@@ -736,18 +738,22 @@ impl TileRasterPipeline {
                 cache: None,
             });
 
-        // Tile raster pipeline (select 3DGS or 2DGS shader, inject kernel type)
+        // Tile raster pipeline (select 3DGS or 2DGS shader, inject kernel type + shared mem flag)
+        let use_shmem_val = if use_shared_mem { 1u32 } else { 0u32 };
         let tile_raster_shader_src = if is_2dgs {
             format!(
-                "const KERNEL_TYPE: u32 = {}u;\n{}",
+                "const KERNEL_TYPE: u32 = {}u;\nconst USE_SHARED_MEM: u32 = {}u;\n{}",
                 kernel_type,
+                use_shmem_val,
                 include_str!("shaders/tile_raster_2dgs.wgsl")
             )
         } else {
             include_str!("shaders/tile_raster.wgsl").to_string()
         };
-        log::info!("Tile raster kernel_type = {} ({})", kernel_type,
-            match kernel_type { 0 => "Gaussian", 1 => "Beta", 4 => "BetaScaled", _ => "Unknown" });
+        log::info!("Tile raster kernel_type = {} ({}), shared_mem = {}",
+            kernel_type,
+            match kernel_type { 0 => "Gaussian", 1 => "Beta", 4 => "BetaScaled", _ => "Unknown" },
+            use_shared_mem);
         let tile_raster_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tile raster shader"),
             source: wgpu::ShaderSource::Wgsl(tile_raster_shader_src.into()),
@@ -907,11 +913,16 @@ impl TileRasterPipeline {
             cached_num_points: num_points,
             max_tile_entries,
             kernel_type,
+            use_shared_mem,
         }
     }
 
     pub fn kernel_type(&self) -> u32 {
         self.kernel_type
+    }
+
+    pub fn use_shared_mem(&self) -> bool {
+        self.use_shared_mem
     }
 
     fn create_tile_raster_bg(

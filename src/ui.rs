@@ -180,6 +180,9 @@ pub(crate) fn ui(state: &mut WindowContext) -> bool {
                             }
                         });
                     ui.end_row();
+                    ui.label("Shared Memory");
+                    ui.checkbox(&mut state.use_shared_mem, "");
+                    ui.end_row();
                 }
             });
     });

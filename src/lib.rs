@@ -154,6 +154,7 @@ pub struct WindowContext {
     compute_raster_enabled: bool,
     tile_raster: Option<tile_raster::TileRasterPipeline>,
     pub(crate) kernel_type_override: u32, // current kernel type for compute raster
+    pub(crate) use_shared_mem: bool,     // shared memory vs direct global reads
 
     saved_cameras: Vec<SceneCamera>,
     #[cfg(feature = "video")]
@@ -323,6 +324,7 @@ impl WindowContext {
             compute_raster_enabled: render_config.compute_raster,
             tile_raster: None,
             kernel_type_override,
+            use_shared_mem: true,
         })
     }
 
@@ -447,10 +449,10 @@ impl WindowContext {
         // do prepare stuff
 
         if self.compute_raster_enabled {
-            // Recreate pipeline if kernel type changed
+            // Recreate pipeline if kernel type or shared mem setting changed
             if let Some(ref tr) = self.tile_raster {
-                if tr.kernel_type() != self.kernel_type_override {
-                    log::info!("Kernel type changed to {}, recreating pipeline", self.kernel_type_override);
+                if tr.kernel_type() != self.kernel_type_override || tr.use_shared_mem() != self.use_shared_mem {
+                    log::info!("Tile raster config changed, recreating pipeline");
                     let size = self.window.inner_size();
                     let mut new_tr = tile_raster::TileRasterPipeline::new(
                         &self.wgpu_context.device,
@@ -463,6 +465,7 @@ impl WindowContext {
                         size.height,
                         self.pc.is_2dgs(),
                         self.kernel_type_override,
+                        self.use_shared_mem,
                     );
                     new_tr.update_splat_bind_group(&self.wgpu_context.device, &self.pc);
                     self.tile_raster = Some(new_tr);
@@ -810,6 +813,7 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
             size.height,
             state.pc.is_2dgs(),
             state.pc.kernel_type(),
+            state.use_shared_mem,
         );
         tr.update_splat_bind_group(&state.wgpu_context.device, &state.pc);
         state.tile_raster = Some(tr);
@@ -886,6 +890,7 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
                                 size.height,
                                 state.pc.is_2dgs(),
                                 state.pc.kernel_type(),
+                                state.use_shared_mem,
                             );
                             tr.update_splat_bind_group(&state.wgpu_context.device, &state.pc);
                             state.tile_raster = Some(tr);

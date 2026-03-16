@@ -256,7 +256,15 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>) {
     );
 
     // world2ndc = (proj * view)^T — matches CUDA GLM reindexing convention
-    let world2ndc = transpose(camera.proj * camera.view);
+    // camera.proj includes VIEWPORT_Y_FLIP (diag(1,-1,1,1)) for WebGPU rendering.
+    // For transmat computation we need the raw projection (no Y-flip).
+    // Undo Y-flip by negating the y-component of each column.
+    var proj_raw = camera.proj;
+    proj_raw[0].y = -proj_raw[0].y;
+    proj_raw[1].y = -proj_raw[1].y;
+    proj_raw[2].y = -proj_raw[2].y;
+    proj_raw[3].y = -proj_raw[3].y;
+    let world2ndc = transpose(proj_raw * camera.view);
 
     // ndc2pix: maps NDC to pixel coordinates (mat3x4 = 3 cols of vec4)
     let ndc2pix = mat3x4<f32>(

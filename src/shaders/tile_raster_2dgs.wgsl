@@ -102,7 +102,8 @@ fn main(
     var T_acc: f32 = 1.0;
     var done = false;
 
-    let rounds = (num_gaussians + BLOCK_SIZE - 1u) / BLOCK_SIZE;
+    // Cap rounds to prevent GPU timeout during debugging (256 rounds = 64K gaussians max per tile)
+    let rounds = min((num_gaussians + BLOCK_SIZE - 1u) / BLOCK_SIZE, 256u);
 
     for (var round = 0u; round < rounds; round++) {
         // Batch load: each thread loads one splat into shared memory (compact copy)

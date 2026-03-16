@@ -980,6 +980,32 @@ impl TileRasterPipeline {
         queue.submit(Some(encoder.finish()));
         device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
         log::info!("[TILE DEBUG] All passes completed successfully");
+
+        // Readback diagnostics: num_visible and total_tile_entries
+        Self::readback_u32(device, queue, &self.preprocess_sort_uni, 0, "num_visible (preprocess sort_infos.keys_size)");
+        Self::readback_u32(device, queue, &self.tile_sort_uni, 0, "total_tile_entries (tile sort_infos.keys_size)");
+    }
+
+    fn readback_u32(device: &wgpu::Device, queue: &wgpu::Queue, src: &wgpu::Buffer, offset: u64, label: &str) {
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback staging"),
+            size: 4,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("readback") });
+        enc.copy_buffer_to_buffer(src, offset, &staging, 0, 4);
+        queue.submit(Some(enc.finish()));
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).unwrap(); });
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        rx.recv().unwrap().unwrap();
+        let data = slice.get_mapped_range();
+        let val = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        log::info!("[TILE DEBUG] {} = {}", label, val);
     }
 
     fn prepare_inner(

@@ -1,6 +1,8 @@
 // 2DGS Surfel tile-based compute rasterizer.
-// Ray-disk intersection with transmat (Tu, Tv, Tw) and beta_scaled kernel.
-// Matches CUDA renderBakedCUDA from diff_surfel_bake_render.
+// Ray-disk intersection with transmat (Tu, Tv, Tw).
+// Kernel type injected at compile time: KERNEL_TYPE constant.
+//   0 = Gaussian (exp(-rho3d))
+//   4 = BetaScaled (pow(1-rho3d/k², shape))
 
 const BLOCK_SIZE: u32 = 256u;
 const T_THRESHOLD: f32 = 0.0001;
@@ -162,21 +164,33 @@ fn main(
             let d_pix = center_pix - pixf;
             let rho2d = FILTER_INV_SQUARE * dot(d_pix, d_pix);
 
-            // Beta_scaled kernel (k²=9)
             let opa = splat.opacity;
             let ba = unpack2x16float(splat.color_b_shape);
-            let shape = ba.y;
-            let k_sq = 9.0;
 
-            if rho3d >= k_sq + 1e-6 {
-                continue;
+            // Kernel evaluation — selected at compile time via KERNEL_TYPE constant
+            var alpha: f32;
+
+            if KERNEL_TYPE == 4u {
+                // BetaScaled kernel: pow(max(0, 1-rho3d/k²), shape), k²=9
+                let shape = ba.y;
+                let k_sq = 9.0;
+
+                if rho3d >= k_sq + 1e-6 {
+                    continue;
+                }
+
+                let base = max(0.0, 1.0 - rho3d / k_sq);
+                let alpha_beta = pow(base, shape);
+                let alpha_lp = exp(-rho2d / 2.0);
+                let kernel_val = max(alpha_beta, alpha_lp);
+                alpha = min(0.99, opa * kernel_val);
+            } else {
+                // Gaussian kernel: exp(-rho3d)
+                let alpha_3d = exp(-rho3d);
+                let alpha_lp = exp(-rho2d / 2.0);
+                let kernel_val = max(alpha_3d, alpha_lp);
+                alpha = min(0.99, opa * kernel_val);
             }
-
-            let base = max(0.0, 1.0 - rho3d / k_sq);
-            let alpha_beta = pow(base, shape);
-            let alpha_lp = exp(-rho2d / 2.0);
-            let kernel_val = max(alpha_beta, alpha_lp);
-            let alpha = min(0.99, opa * kernel_val);
 
             if alpha < 1.0 / 255.0 {
                 continue;

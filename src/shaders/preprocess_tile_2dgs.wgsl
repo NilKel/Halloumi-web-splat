@@ -292,28 +292,39 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>) {
         vec3<f32>(dot(I0, np2), dot(I1, np2), dot(I2, np2)),  // column 2 = Tw
     );
 
-    // AdR (Adaptive Radius) cutoff for beta_scaled kernel (kernel_type 4)
-    // k²=9, k=3 for beta_scaled
-    let k_sq = 9.0;
-    let k = 3.0;
-
+    // Compute adaptive cutoff radius based on kernel type (injected at compile time)
     var cutoff: f32;
     if opacity < (1.0 / 255.0) {
         return;
     }
-    let ratio = 1.0 / (255.0 * opacity);
-    var r_beta = 0.0;
-    let threshold = pow(ratio, 1.0 / shape);
-    if threshold < 1.0 {
-        r_beta = k * sqrt(1.0 - threshold);
+
+    if KERNEL_TYPE == 4u {
+        // AdR for beta_scaled kernel: k²=9, k=3
+        let k_sq = 9.0;
+        let k = 3.0;
+        let ratio = 1.0 / (255.0 * opacity);
+        var r_beta = 0.0;
+        let threshold = pow(ratio, 1.0 / shape);
+        if threshold < 1.0 {
+            r_beta = k * sqrt(1.0 - threshold);
+        }
+        var r_lp = 0.0;
+        let log_term = log(255.0 * opacity);
+        if log_term > 0.0 {
+            r_lp = sqrt(2.0 * log_term);
+        }
+        cutoff = max(r_beta, r_lp);
+        cutoff = min(cutoff, k + 2.0);
+    } else {
+        // Gaussian kernel: cutoff = sqrt(-2 * ln(1/(255*opacity)))
+        let log_term = log(255.0 * opacity);
+        if log_term > 0.0 {
+            cutoff = sqrt(2.0 * log_term);
+        } else {
+            return;
+        }
+        cutoff = min(cutoff, 3.5); // conservative max for gaussian
     }
-    var r_lp = 0.0;
-    let log_term = log(255.0 * opacity);
-    if log_term > 0.0 {
-        r_lp = sqrt(2.0 * log_term);
-    }
-    cutoff = max(r_beta, r_lp);
-    cutoff = min(cutoff, k + 2.0);
 
     // Compute AABB from transmat
     let aabb = compute_aabb(T_mat, cutoff);

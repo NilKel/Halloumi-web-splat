@@ -147,6 +147,7 @@ impl TileRasterPipeline {
         width: u32,
         height: u32,
         is_2dgs: bool,
+        kernel_type: u32,
     ) -> Self {
         let tiles_x = (width + TILE_SIZE - 1) / TILE_SIZE;
         let tiles_y = (height + TILE_SIZE - 1) / TILE_SIZE;
@@ -610,8 +611,9 @@ impl TileRasterPipeline {
         // Preprocess tile pipeline (select 3DGS or 2DGS shader)
         let preprocess_tile_shader_src = if is_2dgs {
             format!(
-                "const MAX_SH_DEG:u32 = {}u;\n{}",
+                "const MAX_SH_DEG:u32 = {}u;\nconst KERNEL_TYPE: u32 = {}u;\n{}",
                 sh_deg,
+                kernel_type,
                 include_str!("shaders/preprocess_tile_2dgs.wgsl")
             )
         } else {
@@ -733,14 +735,21 @@ impl TileRasterPipeline {
                 cache: None,
             });
 
-        // Tile raster pipeline (select 3DGS or 2DGS shader)
+        // Tile raster pipeline (select 3DGS or 2DGS shader, inject kernel type)
+        let tile_raster_shader_src = if is_2dgs {
+            format!(
+                "const KERNEL_TYPE: u32 = {}u;\n{}",
+                kernel_type,
+                include_str!("shaders/tile_raster_2dgs.wgsl")
+            )
+        } else {
+            include_str!("shaders/tile_raster.wgsl").to_string()
+        };
+        log::info!("Tile raster kernel_type = {} ({})", kernel_type,
+            match kernel_type { 0 => "Gaussian", 1 => "Beta", 4 => "BetaScaled", _ => "Unknown" });
         let tile_raster_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tile raster shader"),
-            source: wgpu::ShaderSource::Wgsl(if is_2dgs {
-                include_str!("shaders/tile_raster_2dgs.wgsl").into()
-            } else {
-                include_str!("shaders/tile_raster.wgsl").into()
-            }),
+            source: wgpu::ShaderSource::Wgsl(tile_raster_shader_src.into()),
         });
         let tile_raster_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("tile raster pipeline layout"),

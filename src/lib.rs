@@ -783,6 +783,7 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
             size.width,
             size.height,
             state.pc.is_2dgs(),
+            state.pc.kernel_type(),
         );
         tr.update_splat_bind_group(&state.wgpu_context.device, &state.pc);
         state.tile_raster = Some(tr);
@@ -858,6 +859,7 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
                                 size.width,
                                 size.height,
                                 state.pc.is_2dgs(),
+                                state.pc.kernel_type(),
                             );
                             tr.update_splat_bind_group(&state.wgpu_context.device, &state.pc);
                             state.tile_raster = Some(tr);

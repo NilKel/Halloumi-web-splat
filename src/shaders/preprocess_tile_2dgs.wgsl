@@ -259,19 +259,18 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>) {
     let s2w_r1 = vec4<f32>(L1, 0.0);
     let s2w_r2 = vec4<f32>(xyz, 1.0);
 
-    // world2ndc = (proj * view)^T — matches CUDA GLM reindexing convention
+    // world2ndc = P * V (no transpose — WGSL mat4x4 * mat4x4 gives the standard product)
     // camera.proj includes VIEWPORT_Y_FLIP (diag(1,-1,1,1)) for WebGPU rendering.
-    // Undo Y-flip by negating the y-component of each column.
+    // Undo Y-flip by negating the y-component of each column (= negating row 1).
     var proj_raw = camera.proj;
     proj_raw[0].y = -proj_raw[0].y;
     proj_raw[1].y = -proj_raw[1].y;
     proj_raw[2].y = -proj_raw[2].y;
     proj_raw[3].y = -proj_raw[3].y;
-    let M = transpose(proj_raw * camera.view);  // world2ndc, 4x4
+    let M = proj_raw * camera.view;  // world2ndc = P*V, M[j] = column j
 
     // Compute intermediate: I = transpose(s2w) * M  (3 rows × 4 cols, stored as 3 vec4 rows)
-    // I[i] = vec4(dot(s2w_ri, M_col0), dot(s2w_ri, M_col1), dot(s2w_ri, M_col2), dot(s2w_ri, M_col3))
-    // Since M = transpose(...), M[j] is column j.
+    // I[i][j] = dot(s2w_row_i, M_col_j), and M[j] is column j in WGSL.
     let I0 = vec4<f32>(dot(s2w_r0, M[0]), dot(s2w_r0, M[1]), dot(s2w_r0, M[2]), dot(s2w_r0, M[3]));
     let I1 = vec4<f32>(dot(s2w_r1, M[0]), dot(s2w_r1, M[1]), dot(s2w_r1, M[2]), dot(s2w_r1, M[3]));
     let I2 = vec4<f32>(dot(s2w_r2, M[0]), dot(s2w_r2, M[1]), dot(s2w_r2, M[2]), dot(s2w_r2, M[3]));

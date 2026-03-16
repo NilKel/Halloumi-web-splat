@@ -1238,6 +1238,10 @@ impl TileRasterPipeline {
             pass.dispatch_workgroups(tiles_x, tiles_y, 1);
         });
 
+        // Read back actual tile entry count
+        Self::readback_u32(device, queue, &self.preprocess_sort_uni, 0, "num_visible");
+        Self::readback_u32(device, queue, &self.tile_sort_uni, 0, "total_tile_entries");
+
         // Resolve GPU timestamps
         {
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1279,6 +1283,8 @@ impl TileRasterPipeline {
         ];
 
         log::info!("===== COMPUTE RASTER GPU BENCHMARK =====");
+        log::info!("  viewport: {}x{}, tiles: {}x{} = {}, points: {}, max_tile_entries: {}",
+            width, height, tiles_x, tiles_y, total_tiles, num_points, self.max_tile_entries);
         log::info!("  {:20}   {:>8}   {:>8}", "PASS", "GPU ms", "CPU ms");
         let mut total_cpu = 0.0f64;
         let mut gpu_idx: usize = 0;

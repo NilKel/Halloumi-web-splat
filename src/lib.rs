@@ -443,9 +443,9 @@ impl WindowContext {
         // do prepare stuff
 
         if self.compute_raster_enabled {
-            // Compute raster path
+            // Compute raster path: single submission for all compute passes
             {
-                let compute_encoder =
+                let mut compute_encoder =
                     self.wgpu_context
                         .device
                         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -453,17 +453,16 @@ impl WindowContext {
                         });
 
                 if let Some(ref mut tr) = self.tile_raster {
-                    drop(compute_encoder);
-                    tr.prepare_debug(
-                        &self.wgpu_context.device,
+                    tr.prepare(
+                        &mut compute_encoder,
                         &self.wgpu_context.queue,
                         &self.pc,
                         self.renderer.sorter(),
                         self.splatting_args,
                     );
-                } else {
-                    self.wgpu_context.queue.submit([compute_encoder.finish()]);
                 }
+
+                self.wgpu_context.queue.submit([compute_encoder.finish()]);
             }
         } else {
             // Hardware raster path: preprocess + sort

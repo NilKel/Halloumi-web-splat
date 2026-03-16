@@ -443,28 +443,25 @@ impl WindowContext {
         // do prepare stuff
 
         if self.compute_raster_enabled {
-            // Compute raster path: skip compute passes if scene unchanged (reuse cached output_buf)
-            if redraw_scene {
-                let t0 = Instant::now();
-                let mut compute_encoder =
-                    self.wgpu_context
-                        .device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("compute raster encoder"),
-                        });
+            // Compute raster path
+            let mut compute_encoder =
+                self.wgpu_context
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("compute raster encoder"),
+                    });
 
-                if let Some(ref mut tr) = self.tile_raster {
-                    tr.prepare(
-                        &mut compute_encoder,
-                        &self.wgpu_context.queue,
-                        &self.pc,
-                        self.renderer.sorter(),
-                        self.splatting_args,
-                    );
-                }
-
-                self.wgpu_context.queue.submit([compute_encoder.finish()]);
+            if let Some(ref mut tr) = self.tile_raster {
+                tr.prepare(
+                    &mut compute_encoder,
+                    &self.wgpu_context.queue,
+                    &self.pc,
+                    self.renderer.sorter(),
+                    self.splatting_args,
+                );
             }
+
+            self.wgpu_context.queue.submit([compute_encoder.finish()]);
         } else {
             // Hardware raster path: preprocess + sort
             {

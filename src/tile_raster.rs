@@ -1007,8 +1007,8 @@ impl TileRasterPipeline {
         Self::readback_u32(device, queue, &self.tile_sort_uni, 0, "total_tile_entries (tile sort_infos.keys_size)");
     }
 
-    /// Benchmark version: uses GPU timestamp queries to measure each pass individually.
-    /// Submits, polls, and logs per-pass GPU timings. Call once to profile.
+    /// Benchmark version: submits each pass individually with CPU timing + GPU timestamp queries.
+    /// Press B to profile per-pass GPU costs.
     pub fn prepare_benchmark(
         &mut self,
         device: &wgpu::Device,
@@ -1017,11 +1017,12 @@ impl TileRasterPipeline {
         sorter: &GPURSSorter,
         render_settings: SplattingArgs,
     ) {
-        // We need 10 timestamp pairs (start/end) for each section:
-        // 0: preprocess, 1: prefix_reduce, 2: prefix_scan, 3: prefix_propagate,
-        // 4: update_sort_info, 5: duplicate_keys, 6: radix_sort, 7: identify_ranges,
-        // 8: tile_raster
-        const NUM_TIMESTAMPS: u32 = 20; // 10 pairs
+        use std::time::Instant;
+
+        // 8 compute passes we control get GPU timestamp queries (begin+end per pass = 16 timestamps)
+        // Radix sort is timed with CPU only (we don't control its internal passes)
+        const NUM_TIMED_PASSES: u32 = 8;
+        const NUM_TIMESTAMPS: u32 = NUM_TIMED_PASSES * 2;
 
         let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
             label: Some("benchmark query set"),
@@ -1031,7 +1032,7 @@ impl TileRasterPipeline {
 
         let resolve_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("benchmark resolve"),
-            size: (NUM_TIMESTAMPS as u64) * 8, // u64 per timestamp
+            size: (NUM_TIMESTAMPS as u64) * 8,
             usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
@@ -1043,12 +1044,7 @@ impl TileRasterPipeline {
             mapped_at_creation: false,
         });
 
-        // Run the full pipeline with timestamp markers
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("benchmark encoder"),
-        });
-
-        // --- Uniform updates (same as prepare_inner) ---
+        // --- Uniform updates ---
         let viewport = render_settings.viewport;
         let width = viewport.x;
         let height = viewport.y;
@@ -1108,109 +1104,137 @@ impl TileRasterPipeline {
 
         queue.write_buffer(&self.preprocess_sort_uni, 0, &[0u8; 4]);
         queue.write_buffer(&self.preprocess_sort_dis, 0, &[0u8; 4]);
-        encoder.clear_buffer(&self.tile_starts_buf, 0, None);
-        encoder.clear_buffer(&self.tile_ends_buf, 0, None);
-        encoder.clear_buffer(&self.tiles_touched_buf, 0, None);
+
+        // Clear buffers
+        {
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("benchmark clear"),
+            });
+            encoder.clear_buffer(&self.tile_starts_buf, 0, None);
+            encoder.clear_buffer(&self.tile_ends_buf, 0, None);
+            encoder.clear_buffer(&self.tiles_touched_buf, 0, None);
+            queue.submit(Some(encoder.finish()));
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        }
 
         let wgs_points = (num_points as f32 / 256.0).ceil() as u32;
+        let period = queue.get_timestamp_period();
+
+        // Helper: submit one compute pass with GPU timestamps, poll, return GPU time in ms
+        // Uses ComputePassDescriptor::timestamp_writes (works on Metal, unlike encoder.write_timestamp)
+        let mut ts_idx: u32 = 0;
+
+        macro_rules! timed_pass {
+            ($label:expr, |$pass:ident| $body:block) => {{
+                let begin_idx = ts_idx;
+                let end_idx = ts_idx + 1;
+                ts_idx += 2;
+                let cpu_t0 = Instant::now();
+                let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some(concat!("bench ", $label)),
+                });
+                {
+                    let mut $pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some($label),
+                        timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                            query_set: &query_set,
+                            beginning_of_pass_write_index: Some(begin_idx),
+                            end_of_pass_write_index: Some(end_idx),
+                        }),
+                    });
+                    $body
+                }
+                queue.submit(Some(encoder.finish()));
+                device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+                let cpu_ms = cpu_t0.elapsed().as_secs_f64() * 1000.0;
+                cpu_ms
+            }};
+        }
 
         // --- Pass 0: Preprocess ---
-        encoder.write_timestamp(&query_set, 0);
-        {
-            let mut pass = encoder.begin_compute_pass(&Default::default());
+        let cpu_preprocess = timed_pass!("preprocess", |pass| {
             pass.set_pipeline(&self.preprocess_tile_pipeline);
             pass.set_bind_group(0, self.camera.bind_group(), &[]);
             pass.set_bind_group(1, pc.bind_group(), &[]);
             pass.set_bind_group(2, &self.preprocess_sort_bg, &[]);
             pass.set_bind_group(3, &self.preprocess_tile_bg3, &[]);
             pass.dispatch_workgroups(wgs_points, 1, 1);
-        }
-        encoder.write_timestamp(&query_set, 1);
+        });
 
         // --- Pass 1: Prefix sum reduce ---
-        encoder.write_timestamp(&query_set, 2);
-        {
-            let mut pass = encoder.begin_compute_pass(&Default::default());
+        let cpu_prefix_reduce = timed_pass!("prefix_reduce", |pass| {
             pass.set_pipeline(&self.prefix_sum_reduce);
             pass.set_bind_group(0, &self.prefix_sum_bg, &[]);
             pass.dispatch_workgroups(wgs_points, 1, 1);
-        }
-        encoder.write_timestamp(&query_set, 3);
+        });
 
         // --- Pass 2: Prefix sum scan blocks ---
-        encoder.write_timestamp(&query_set, 4);
-        {
-            let mut pass = encoder.begin_compute_pass(&Default::default());
+        let cpu_prefix_scan = timed_pass!("prefix_scan_blocks", |pass| {
             pass.set_pipeline(&self.prefix_sum_scan_blocks);
             pass.set_bind_group(0, &self.prefix_sum_bg, &[]);
             pass.dispatch_workgroups(1, 1, 1);
-        }
-        encoder.write_timestamp(&query_set, 5);
+        });
 
         // --- Pass 3: Prefix sum propagate ---
-        encoder.write_timestamp(&query_set, 6);
-        {
-            let mut pass = encoder.begin_compute_pass(&Default::default());
+        let cpu_prefix_prop = timed_pass!("prefix_propagate", |pass| {
             pass.set_pipeline(&self.prefix_sum_propagate);
             pass.set_bind_group(0, &self.prefix_sum_bg, &[]);
             pass.dispatch_workgroups(wgs_points, 1, 1);
-        }
-        encoder.write_timestamp(&query_set, 7);
+        });
 
         // --- Pass 4: Update sort info ---
-        encoder.write_timestamp(&query_set, 8);
-        {
-            let mut pass = encoder.begin_compute_pass(&Default::default());
+        let cpu_update = timed_pass!("update_sort_info", |pass| {
             pass.set_pipeline(&self.update_sort_info_pipeline);
             pass.set_bind_group(0, &self.update_sort_info_bg, &[]);
             pass.dispatch_workgroups(1, 1, 1);
-        }
-        encoder.write_timestamp(&query_set, 9);
+        });
 
         // --- Pass 5: Duplicate keys ---
-        encoder.write_timestamp(&query_set, 10);
-        {
-            let mut pass = encoder.begin_compute_pass(&Default::default());
+        let cpu_duplicate = timed_pass!("duplicate_keys", |pass| {
             pass.set_pipeline(&self.duplicate_keys_pipeline);
             pass.set_bind_group(0, &self.duplicate_keys_bg, &[]);
             pass.dispatch_workgroups(wgs_points, 1, 1);
-        }
-        encoder.write_timestamp(&query_set, 11);
+        });
 
-        // --- Pass 6: Radix sort ---
-        encoder.write_timestamp(&query_set, 12);
-        sorter.record_sort_indirect(&self.tile_sort_bg, &self.tile_sort_dis, &mut encoder);
-        encoder.write_timestamp(&query_set, 13);
+        // --- Pass 6: Radix sort (CPU-timed only, multiple internal passes) ---
+        let cpu_sort = {
+            let cpu_t0 = Instant::now();
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("bench radix_sort"),
+            });
+            sorter.record_sort_indirect(&self.tile_sort_bg, &self.tile_sort_dis, &mut encoder);
+            queue.submit(Some(encoder.finish()));
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            cpu_t0.elapsed().as_secs_f64() * 1000.0
+        };
 
         // --- Pass 7: Identify ranges ---
-        encoder.write_timestamp(&query_set, 14);
-        {
-            let mut pass = encoder.begin_compute_pass(&Default::default());
+        let cpu_identify = timed_pass!("identify_ranges", |pass| {
             pass.set_pipeline(&self.identify_ranges_pipeline);
             pass.set_bind_group(0, &self.identify_ranges_bg, &[]);
             let wgs = (self.max_tile_entries as f32 / 256.0).ceil() as u32;
             pass.dispatch_workgroups(wgs.max(1), 1, 1);
-        }
-        encoder.write_timestamp(&query_set, 15);
+        });
 
         // --- Pass 8: Tile raster ---
-        encoder.write_timestamp(&query_set, 16);
-        {
-            let mut pass = encoder.begin_compute_pass(&Default::default());
+        let cpu_tile_raster = timed_pass!("tile_raster", |pass| {
             pass.set_pipeline(&self.tile_raster_pipeline);
             pass.set_bind_group(0, &self.tile_raster_bg, &[]);
             pass.dispatch_workgroups(tiles_x, tiles_y, 1);
+        });
+
+        // Resolve GPU timestamps
+        {
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("benchmark resolve"),
+            });
+            encoder.resolve_query_set(&query_set, 0..ts_idx, &resolve_buf, 0);
+            encoder.copy_buffer_to_buffer(&resolve_buf, 0, &readback_buf, 0, (ts_idx as u64) * 8);
+            queue.submit(Some(encoder.finish()));
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
         }
-        encoder.write_timestamp(&query_set, 17);
 
-        // Resolve timestamps
-        encoder.resolve_query_set(&query_set, 0..NUM_TIMESTAMPS, &resolve_buf, 0);
-        encoder.copy_buffer_to_buffer(&resolve_buf, 0, &readback_buf, 0, (NUM_TIMESTAMPS as u64) * 8);
-
-        queue.submit(Some(encoder.finish()));
-        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-
-        // Read back timestamps
+        // Read back GPU timestamps
         let slice = readback_buf.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).unwrap(); });
@@ -1218,31 +1242,48 @@ impl TileRasterPipeline {
         rx.recv().unwrap().unwrap();
         let data = slice.get_mapped_range();
         let timestamps: &[u64] = bytemuck::cast_slice(&data);
-        let period = queue.get_timestamp_period(); // nanoseconds per tick
 
-        let labels = [
+        let gpu_labels = [
             "preprocess",
             "prefix_reduce",
             "prefix_scan_blocks",
             "prefix_propagate",
             "update_sort_info",
             "duplicate_keys",
-            "radix_sort",
+            // radix_sort has no GPU timestamps
             "identify_ranges",
             "tile_raster",
         ];
+        let cpu_times = [
+            cpu_preprocess, cpu_prefix_reduce, cpu_prefix_scan, cpu_prefix_prop,
+            cpu_update, cpu_duplicate, cpu_sort, cpu_identify, cpu_tile_raster,
+        ];
+        let all_labels = [
+            "preprocess", "prefix_reduce", "prefix_scan_blocks", "prefix_propagate",
+            "update_sort_info", "duplicate_keys", "radix_sort", "identify_ranges", "tile_raster",
+        ];
 
         log::info!("===== COMPUTE RASTER GPU BENCHMARK =====");
-        let mut total_ns: f64 = 0.0;
-        for (i, label) in labels.iter().enumerate() {
-            let start = timestamps[i * 2];
-            let end = timestamps[i * 2 + 1];
-            let ns = (end.wrapping_sub(start)) as f64 * period as f64;
-            let ms = ns / 1_000_000.0;
-            total_ns += ns;
-            log::info!("  {:20} : {:8.2} ms", label, ms);
+        log::info!("  {:20}   {:>8}   {:>8}", "PASS", "GPU ms", "CPU ms");
+        let mut total_cpu = 0.0f64;
+        let mut gpu_idx: usize = 0;
+        for (i, label) in all_labels.iter().enumerate() {
+            let cpu_ms = cpu_times[i];
+            total_cpu += cpu_ms;
+
+            if *label == "radix_sort" {
+                // No GPU timestamps for radix sort
+                log::info!("  {:20} : {:>8}   {:8.2}", label, "N/A", cpu_ms);
+            } else {
+                let start = timestamps[gpu_idx * 2];
+                let end = timestamps[gpu_idx * 2 + 1];
+                let gpu_ns = (end.wrapping_sub(start)) as f64 * period as f64;
+                let gpu_ms = gpu_ns / 1_000_000.0;
+                log::info!("  {:20} : {:8.2}   {:8.2}", label, gpu_ms, cpu_ms);
+                gpu_idx += 1;
+            }
         }
-        log::info!("  {:20} : {:8.2} ms", "TOTAL", total_ns / 1_000_000.0);
+        log::info!("  {:20} : {:>8}   {:8.2}", "TOTAL", "", total_cpu);
         log::info!("========================================");
     }
 

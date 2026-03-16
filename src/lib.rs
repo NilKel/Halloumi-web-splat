@@ -445,6 +445,7 @@ impl WindowContext {
         if self.compute_raster_enabled {
             // Compute raster path: skip compute passes if scene unchanged (reuse cached output_buf)
             if redraw_scene {
+                let t0 = Instant::now();
                 let mut compute_encoder =
                     self.wgpu_context
                         .device
@@ -463,6 +464,9 @@ impl WindowContext {
                 }
 
                 self.wgpu_context.queue.submit([compute_encoder.finish()]);
+                self.wgpu_context.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+                let gpu_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                log::info!("[COMPUTE TIMING] GPU compute: {:.1}ms", gpu_ms);
             }
         } else {
             // Hardware raster path: preprocess + sort

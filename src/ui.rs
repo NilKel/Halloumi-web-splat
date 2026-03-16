@@ -22,15 +22,17 @@ use egui_plot::{Legend, PlotPoints};
 pub(crate) fn ui(state: &mut WindowContext) -> bool {
     let ctx = state.ui_renderer.winit.egui_ctx();
     #[cfg(not(target_arch = "wasm32"))]
-    if let Some(stopwatch) = state.stopwatch.as_mut() {
-        let durations = pollster::block_on(
-            stopwatch.take_measurements(&state.wgpu_context.device, &state.wgpu_context.queue),
-        );
-        state.history.push((
-            *durations.get("preprocess").unwrap_or(&Duration::ZERO),
-            *durations.get("sorting").unwrap_or(&Duration::ZERO),
-            *durations.get("rasterization").unwrap_or(&Duration::ZERO),
-        ));
+    if !state.compute_raster_enabled {
+        if let Some(stopwatch) = state.stopwatch.as_mut() {
+            let durations = pollster::block_on(
+                stopwatch.take_measurements(&state.wgpu_context.device, &state.wgpu_context.queue),
+            );
+            state.history.push((
+                *durations.get("preprocess").unwrap_or(&Duration::ZERO),
+                *durations.get("sorting").unwrap_or(&Duration::ZERO),
+                *durations.get("rasterization").unwrap_or(&Duration::ZERO),
+            ));
+        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]

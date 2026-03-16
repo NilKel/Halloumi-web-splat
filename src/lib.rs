@@ -515,6 +515,9 @@ impl WindowContext {
                     tp.as_mut().atlas_width = w;
                     tp.sync(&self.wgpu_context.queue);
                 }
+                if let Some(ref mut tr) = self.tile_raster {
+                    tr.set_atlas_enabled(self.atlas_enabled, self.pc.atlas_width());
+                }
 
                 self.renderer.prepare(
                     &mut compute_encoder,

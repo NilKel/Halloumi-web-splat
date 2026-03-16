@@ -1,6 +1,6 @@
 use crate::gpu_rs::GPURSSorter;
 use crate::pointcloud::PointCloud;
-use crate::renderer::{CameraUniform, SplattingArgs, SplattingArgsUniform};
+use crate::renderer::{CameraUniform, SplattingArgs, SplattingArgsUniform, TexParamsUniform};
 use crate::uniform::UniformBuffer;
 
 use crate::camera::Camera;
@@ -93,6 +93,7 @@ pub struct TileRasterPipeline {
     // Camera + render settings (shared with hardware path)
     camera: UniformBuffer<CameraUniform>,
     render_settings: UniformBuffer<SplattingArgsUniform>,
+    tex_params: UniformBuffer<TexParamsUniform>,
 
     // Preprocess tile bind group (group 3)
     preprocess_tile_bg3: wgpu::BindGroup,
@@ -221,6 +222,8 @@ impl TileRasterPipeline {
         let camera = UniformBuffer::new_default(device, Some("tile raster camera uniform"));
         let render_settings =
             UniformBuffer::new_default(device, Some("tile raster render settings uniform"));
+        let tex_params =
+            UniformBuffer::new_default(device, Some("tile raster tex params uniform"));
 
         // ========== Create buffers ==========
         let tiles_touched_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -532,6 +535,9 @@ impl TileRasterPipeline {
                 storage_rw_entry(4), // output_buf
                 uniform_entry(5),    // tile_raster_info
                 storage_ro_entry(6), // tile_ends
+                storage_ro_entry(7), // atlas_texture
+                storage_ro_entry(8), // atlas_rects
+                uniform_entry(9),    // tex_params
             ],
         });
 
@@ -861,6 +867,9 @@ impl TileRasterPipeline {
             &tile_starts_buf,
             &tile_ends_buf,
             &tile_raster_info,
+            &tex_params,
+            None,
+            None,
             None,
         );
 
@@ -890,6 +899,7 @@ impl TileRasterPipeline {
             viewport_info,
             camera,
             render_settings,
+            tex_params,
 
             preprocess_tile_bg3,
 
@@ -952,6 +962,11 @@ impl TileRasterPipeline {
         (self.cached_width, self.cached_height)
     }
 
+    pub fn set_atlas_enabled(&mut self, enabled: bool, atlas_width: u32) {
+        let tp = self.tex_params.as_mut();
+        tp.atlas_width = if enabled { atlas_width } else { 0 };
+    }
+
     fn create_tile_raster_bg(
         device: &wgpu::Device,
         layout: &wgpu::BindGroupLayout,
@@ -961,20 +976,49 @@ impl TileRasterPipeline {
         tile_starts: &wgpu::Buffer,
         tile_ends: &wgpu::Buffer,
         tile_raster_info: &UniformBuffer<TileRasterInfoUniform>,
+        tex_params: &UniformBuffer<TexParamsUniform>,
         splat_2d_buf: Option<&wgpu::Buffer>,
+        atlas_buf: Option<&wgpu::Buffer>,
+        atlas_rects_buf: Option<&wgpu::Buffer>,
     ) -> wgpu::BindGroup {
-        // If no splat buffer yet, create a dummy
-        let dummy;
+        // Create dummy buffers for missing optional bindings
+        let dummy_splat;
         let splat_resource = if let Some(buf) = splat_2d_buf {
             buf.as_entire_binding()
         } else {
-            dummy = device.create_buffer(&wgpu::BufferDescriptor {
+            dummy_splat = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("dummy splat buffer"),
                 size: 64,
                 usage: wgpu::BufferUsages::STORAGE,
                 mapped_at_creation: false,
             });
-            dummy.as_entire_binding()
+            dummy_splat.as_entire_binding()
+        };
+
+        let dummy_atlas;
+        let atlas_resource = if let Some(buf) = atlas_buf {
+            buf.as_entire_binding()
+        } else {
+            dummy_atlas = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("dummy atlas buffer"),
+                size: 4,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+            dummy_atlas.as_entire_binding()
+        };
+
+        let dummy_rects;
+        let rects_resource = if let Some(buf) = atlas_rects_buf {
+            buf.as_entire_binding()
+        } else {
+            dummy_rects = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("dummy atlas rects buffer"),
+                size: 16,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+            dummy_rects.as_entire_binding()
         };
 
         device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1009,11 +1053,32 @@ impl TileRasterPipeline {
                     binding: 6,
                     resource: tile_ends.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: atlas_resource,
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: rects_resource,
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: tex_params.buffer().as_entire_binding(),
+                },
             ],
         })
     }
 
     pub fn update_splat_bind_group(&mut self, device: &wgpu::Device, pc: &PointCloud) {
+        // Update tex_params with atlas info from pointcloud
+        {
+            let tp = self.tex_params.as_mut();
+            tp.atlas_width = pc.atlas_width();
+            tp.atlas_height = pc.atlas_height();
+            tp.uv_extent_bits = pc.uv_extent().to_bits();
+            tp.kernel_type = pc.kernel_type();
+        }
+
         self.tile_raster_bg = Self::create_tile_raster_bg(
             device,
             &self.tile_raster_bgl,
@@ -1023,7 +1088,10 @@ impl TileRasterPipeline {
             &self.tile_starts_buf,
             &self.tile_ends_buf,
             &self.tile_raster_info,
+            &self.tex_params,
             Some(pc.splat_2d_buffer()),
+            pc.atlas_buffer(),
+            pc.atlas_rects_buffer(),
         );
     }
 
@@ -1119,6 +1187,7 @@ impl TileRasterPipeline {
             *s = SplattingArgsUniform::from_args_and_pc(render_settings, pc);
             self.render_settings.sync(queue);
         }
+        self.tex_params.sync(queue);
         {
             let t = self.tile_info.as_mut();
             t.tiles_x = tiles_x;
@@ -1404,6 +1473,7 @@ impl TileRasterPipeline {
             *s = SplattingArgsUniform::from_args_and_pc(render_settings, pc);
             self.render_settings.sync(queue);
         }
+        self.tex_params.sync(queue);
 
         // Update tile info
         {

@@ -24,7 +24,7 @@ struct Splat2DGS {
     _pad: u32,
 };
 
-// Compact shared memory struct (52 bytes)
+// Compact shared memory struct (56 bytes)
 struct TileSplat {
     tu_x: f32, tu_y: f32, tu_z: f32,
     tv_x: f32, tv_y: f32, tv_z: f32,
@@ -33,6 +33,7 @@ struct TileSplat {
     pos: u32,
     color_rg: u32,
     color_b_shape: u32,
+    gauss_id: u32,
 };
 
 struct CameraUniforms {
@@ -76,10 +77,70 @@ var<storage, read_write> output_buf: array<u32>;
 @group(0) @binding(5)
 var<uniform> tile_info: TileRasterInfo;
 
+@group(0) @binding(7)
+var<storage, read> atlas_texture: array<u32>;
+
+@group(0) @binding(8)
+var<storage, read> atlas_rects: array<f32>;
+
+struct TexParams {
+    atlas_width: u32,
+    atlas_height: u32,
+    kernel_type: u32,
+    uv_extent_bits: u32,
+};
+
+@group(0) @binding(9)
+var<uniform> tex_params: TexParams;
+
 // Shared memory — only allocated when USE_SHARED_MEM == 1
 // When USE_SHARED_MEM == 0, this is still declared but never written/read,
 // so the compiler should optimize it away.
 var<workgroup> sh_splats: array<TileSplat, BLOCK_SIZE>;
+
+// Read a single FP16 value from the atlas texture buffer
+fn read_atlas_f16(row: i32, col: i32, ch: u32, atlas_w: i32) -> f32 {
+    let f16_index = u32(row * atlas_w + col) * 3u + ch;
+    let u32_index = f16_index / 2u;
+    let component = f16_index % 2u;
+    return unpack2x16float(atlas_texture[u32_index])[component];
+}
+
+// Sample atlas with bilinear interpolation at surfel UV
+fn sample_atlas(surfel_uv: vec2<f32>, gauss_id: u32) -> vec3<f32> {
+    let E = bitcast<f32>(tex_params.uv_extent_bits);
+    let r_base = gauss_id * 4u;
+    let u0_px  = atlas_rects[r_base + 0u];
+    let v0_px  = atlas_rects[r_base + 1u];
+    let u_span = atlas_rects[r_base + 2u];
+    let v_span = atlas_rects[r_base + 3u];
+
+    let au = u0_px + (surfel_uv.x + E) / (2.0 * E) * u_span - 0.5;
+    let av = v0_px + (surfel_uv.y + E) / (2.0 * E) * v_span - 0.5;
+    let au_c = clamp(au, u0_px, u0_px + u_span - 1.001);
+    let av_c = clamp(av, v0_px, v0_px + v_span - 1.001);
+
+    let au0 = i32(au_c);
+    let av0 = i32(av_c);
+    let fu = au_c - f32(au0);
+    let fv = av_c - f32(av0);
+    let au1 = min(au0 + 1, i32(u0_px + u_span - 1.0));
+    let av1 = min(av0 + 1, i32(v0_px + v_span - 1.0));
+
+    let aw = i32(tex_params.atlas_width);
+    var residual = vec3<f32>(0.0);
+    for (var ch = 0u; ch < 3u; ch++) {
+        let c00 = read_atlas_f16(av0, au0, ch, aw);
+        let c10 = read_atlas_f16(av0, au1, ch, aw);
+        let c01 = read_atlas_f16(av1, au0, ch, aw);
+        let c11 = read_atlas_f16(av1, au1, ch, aw);
+        residual[ch] = (1.0 - fu) * (1.0 - fv) * c00
+                     + fu * (1.0 - fv) * c10
+                     + (1.0 - fu) * fv * c01
+                     + fu * fv * c11;
+    }
+    return residual;
+}
 
 // ---- Helper: evaluate one splat against a pixel ----
 fn eval_splat_fields(
@@ -87,6 +148,7 @@ fn eval_splat_fields(
     tv_x: f32, tv_y: f32, tv_z: f32,
     tw_x: f32, tw_y: f32, tw_z: f32,
     opa: f32, pos_packed: u32, color_rg_packed: u32, color_b_shape_packed: u32,
+    gauss_id: u32,
     pixf: vec2<f32>,
     T_acc_in: f32,
 ) -> vec4<f32> {
@@ -141,7 +203,14 @@ fn eval_splat_fields(
 
     let w = alpha * T_acc_in;
     let rg = unpack2x16float(color_rg_packed);
-    return vec4<f32>(rg.x * w, rg.y * w, ba.x * w, test_T);
+    var color = vec3<f32>(rg.x, rg.y, ba.x);
+
+    // Atlas texture residual lookup
+    if tex_params.atlas_width > 0u {
+        color += sample_atlas(s, gauss_id);
+    }
+
+    return vec4<f32>(color.x * w, color.y * w, color.z * w, test_T);
 }
 
 @compute @workgroup_size(TILE_SIZE, TILE_SIZE, 1)
@@ -188,6 +257,7 @@ fn main(
                     src.pos,
                     src.color_rg,
                     src.color_b_shape,
+                    src.gauss_id,
                 );
             }
             workgroupBarrier();
@@ -209,6 +279,7 @@ fn main(
                     sp.tv_x, sp.tv_y, sp.tv_z,
                     sp.tw_x, sp.tw_y, sp.tw_z,
                     sp.opacity, sp.pos, sp.color_rg, sp.color_b_shape,
+                    sp.gauss_id,
                     pixf, T_acc,
                 );
 
@@ -237,6 +308,7 @@ fn main(
                     src.tv_x, src.tv_y, src.tv_z,
                     src.tw_x, src.tw_y, src.tw_z,
                     src.opacity, src.pos, src.color_rg, src.color_b_shape,
+                    src.gauss_id,
                     pixf, T_acc,
                 );
 

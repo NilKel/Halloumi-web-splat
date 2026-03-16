@@ -28,11 +28,29 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
 
 @fragment
 fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
-    // DEBUG: test if we can read from the storage buffer at all
-    let val = pixels[0];
-    if val > 0u {
-        return vec4<f32>(1.0, 0.0, 0.0, 1.0); // RED = buffer has data
-    } else {
-        return vec4<f32>(0.0, 0.0, 1.0, 1.0); // BLUE = buffer is zero
+    let pix = vec2<u32>(u32(pos.x), u32(pos.y));
+
+    // DEBUG: check if viewport uniform is valid
+    if viewport.width == 0u || viewport.height == 0u {
+        return vec4<f32>(1.0, 1.0, 0.0, 1.0); // YELLOW = viewport is zero
     }
+
+    if pix.x >= viewport.width || pix.y >= viewport.height {
+        return vec4<f32>(0.0, 1.0, 0.0, 1.0); // GREEN = out of bounds
+    }
+
+    let idx = pix.y * viewport.width + pix.x;
+    let packed = pixels[idx];
+
+    // DEBUG: check if this pixel's data is non-zero
+    if packed == 0u {
+        return vec4<f32>(0.0, 0.0, 1.0, 1.0); // BLUE = pixel data is zero
+    }
+
+    return vec4<f32>(
+        f32(packed & 0xFFu) / 255.0,
+        f32((packed >> 8u) & 0xFFu) / 255.0,
+        f32((packed >> 16u) & 0xFFu) / 255.0,
+        1.0,
+    );
 }

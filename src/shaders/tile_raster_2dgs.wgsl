@@ -87,13 +87,6 @@ fn main(
     let vp_h = tile_info.viewport_h;
     let inside = pix.x < vp_w && pix.y < vp_h;
 
-    // DEBUG: solid red output to test pipeline
-    if inside {
-        let pixel_idx = pix.y * vp_w + pix.x;
-        output_buf[pixel_idx] = 255u | (0u << 8u) | (0u << 16u) | (255u << 24u);
-    }
-    return;
-
     // Pixel position for ray-disk intersection
     let pixf = vec2<f32>(f32(pix.x), f32(pix.y));
 

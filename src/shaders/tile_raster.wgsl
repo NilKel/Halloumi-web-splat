@@ -43,7 +43,10 @@ var<storage, read> splats: array<Splat>;
 var<storage, read> tile_payloads: array<u32>;    // sorted splat indices per tile
 
 @group(0) @binding(3)
-var<storage, read> tile_ranges: array<vec2<u32>>; // (start, end) per tile
+var<storage, read> tile_starts: array<u32>;       // start index per tile
+
+@group(0) @binding(6)
+var<storage, read> tile_ends: array<u32>;         // end index per tile
 
 @group(0) @binding(4)
 var<storage, read_write> output_buf: array<u32>;  // W*H packed RGBA8
@@ -76,8 +79,9 @@ fn main(
 
     // Get tile range
     let tile_id = wg_id.y * tile_info.tiles_x + wg_id.x;
-    let range = tile_ranges[tile_id];
-    let num_gaussians = range.y - range.x;
+    let range_start = tile_starts[tile_id];
+    let range_end = tile_ends[tile_id];
+    let num_gaussians = range_end - range_start;
 
     let thread_idx = local_id.y * 16u + local_id.x;
 
@@ -92,8 +96,8 @@ fn main(
     for (var round = 0u; round < rounds; round++) {
         // Batch load: each thread loads one Gaussian into shared memory
         workgroupBarrier();
-        let load_idx = range.x + round * BLOCK_SIZE + thread_idx;
-        if load_idx < range.y {
+        let load_idx = range_start + round * BLOCK_SIZE + thread_idx;
+        if load_idx < range_end {
             sh_splats[thread_idx] = splats[tile_payloads[load_idx]];
         }
         workgroupBarrier();

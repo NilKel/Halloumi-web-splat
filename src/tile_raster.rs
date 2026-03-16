@@ -102,7 +102,8 @@ pub struct TileRasterPipeline {
     rect_data_buf: wgpu::Buffer,
     depth_16_buf: wgpu::Buffer,
     prefix_sum_block_sums: wgpu::Buffer,
-    tile_ranges_buf: wgpu::Buffer,
+    tile_starts_buf: wgpu::Buffer,
+    tile_ends_buf: wgpu::Buffer,
     output_buf: wgpu::Buffer,
 
     // Tile sort buffers
@@ -241,9 +242,15 @@ impl TileRasterPipeline {
             mapped_at_creation: false,
         });
 
-        let tile_ranges_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("tile_ranges"),
-            size: (total_tiles.max(1) as u64) * 8, // vec2<u32> = 8 bytes
+        let tile_starts_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("tile_starts"),
+            size: (total_tiles.max(1) as u64) * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let tile_ends_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("tile_ends"),
+            size: (total_tiles.max(1) as u64) * 4,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -469,14 +476,15 @@ impl TileRasterPipeline {
             ],
         });
 
-        // Identify ranges: sorted_keys(read) + tile_ranges(rw) + sort_infos(read)
+        // Identify ranges: sorted_keys(read) + tile_starts(rw) + tile_ends(rw) + sort_infos(read)
         let identify_ranges_bgl =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("identify ranges bg layout"),
                 entries: &[
-                    storage_ro_entry(0),
-                    storage_rw_entry(1),
-                    storage_ro_entry(2), // sort_infos (storage, not uniform)
+                    storage_ro_entry(0),  // sorted_keys
+                    storage_rw_entry(1),  // tile_starts
+                    storage_rw_entry(2),  // tile_ends
+                    storage_ro_entry(3),  // sort_infos
                 ],
             });
 
@@ -490,25 +498,30 @@ impl TileRasterPipeline {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: tile_ranges_buf.as_entire_binding(),
+                    resource: tile_starts_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: tile_sort_uni.as_entire_binding(), // has keys_size = total entries
+                    resource: tile_ends_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: tile_sort_uni.as_entire_binding(),
                 },
             ],
         });
 
-        // Tile raster: camera(uniform) + splats(read) + tile_payloads(read) + tile_ranges(read) + output_buf(rw) + tile_info(uniform)
+        // Tile raster: camera(uniform) + splats(read) + tile_payloads(read) + tile_starts(read) + output_buf(rw) + tile_info(uniform) + tile_ends(read)
         let tile_raster_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("tile raster bg layout"),
             entries: &[
                 uniform_entry(0),    // camera
                 storage_ro_entry(1), // splats
                 storage_ro_entry(2), // tile_payloads
-                storage_ro_entry(3), // tile_ranges
+                storage_ro_entry(3), // tile_starts
                 storage_rw_entry(4), // output_buf
                 uniform_entry(5),    // tile_raster_info
+                storage_ro_entry(6), // tile_ends
             ],
         });
 
@@ -816,7 +829,8 @@ impl TileRasterPipeline {
             &camera,
             &output_buf,
             &tile_payloads_a,
-            &tile_ranges_buf,
+            &tile_starts_buf,
+            &tile_ends_buf,
             &tile_raster_info,
             None,
         );
@@ -854,7 +868,8 @@ impl TileRasterPipeline {
             rect_data_buf,
             depth_16_buf,
             prefix_sum_block_sums,
-            tile_ranges_buf,
+            tile_starts_buf,
+            tile_ends_buf,
             output_buf,
 
             tile_keys_a,
@@ -890,7 +905,8 @@ impl TileRasterPipeline {
         camera: &UniformBuffer<CameraUniform>,
         output_buf: &wgpu::Buffer,
         tile_payloads: &wgpu::Buffer,
-        tile_ranges: &wgpu::Buffer,
+        tile_starts: &wgpu::Buffer,
+        tile_ends: &wgpu::Buffer,
         tile_raster_info: &UniformBuffer<TileRasterInfoUniform>,
         splat_2d_buf: Option<&wgpu::Buffer>,
     ) -> wgpu::BindGroup {
@@ -926,7 +942,7 @@ impl TileRasterPipeline {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: tile_ranges.as_entire_binding(),
+                    resource: tile_starts.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
@@ -935,6 +951,10 @@ impl TileRasterPipeline {
                 wgpu::BindGroupEntry {
                     binding: 5,
                     resource: tile_raster_info.buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: tile_ends.as_entire_binding(),
                 },
             ],
         })
@@ -947,7 +967,8 @@ impl TileRasterPipeline {
             &self.camera,
             &self.output_buf,
             &self.tile_payloads_a,
-            &self.tile_ranges_buf,
+            &self.tile_starts_buf,
+            &self.tile_ends_buf,
             &self.tile_raster_info,
             Some(pc.splat_2d_buffer()),
         );
@@ -984,6 +1005,245 @@ impl TileRasterPipeline {
         // Readback diagnostics: num_visible and total_tile_entries
         Self::readback_u32(device, queue, &self.preprocess_sort_uni, 0, "num_visible (preprocess sort_infos.keys_size)");
         Self::readback_u32(device, queue, &self.tile_sort_uni, 0, "total_tile_entries (tile sort_infos.keys_size)");
+    }
+
+    /// Benchmark version: uses GPU timestamp queries to measure each pass individually.
+    /// Submits, polls, and logs per-pass GPU timings. Call once to profile.
+    pub fn prepare_benchmark(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pc: &PointCloud,
+        sorter: &GPURSSorter,
+        render_settings: SplattingArgs,
+    ) {
+        // We need 10 timestamp pairs (start/end) for each section:
+        // 0: preprocess, 1: prefix_reduce, 2: prefix_scan, 3: prefix_propagate,
+        // 4: update_sort_info, 5: duplicate_keys, 6: radix_sort, 7: identify_ranges,
+        // 8: tile_raster
+        const NUM_TIMESTAMPS: u32 = 20; // 10 pairs
+
+        let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("benchmark query set"),
+            ty: wgpu::QueryType::Timestamp,
+            count: NUM_TIMESTAMPS,
+        });
+
+        let resolve_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("benchmark resolve"),
+            size: (NUM_TIMESTAMPS as u64) * 8, // u64 per timestamp
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let readback_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("benchmark readback"),
+            size: (NUM_TIMESTAMPS as u64) * 8,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        // Run the full pipeline with timestamp markers
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("benchmark encoder"),
+        });
+
+        // --- Uniform updates (same as prepare_inner) ---
+        let viewport = render_settings.viewport;
+        let width = viewport.x;
+        let height = viewport.y;
+        let tiles_x = (width + TILE_SIZE - 1) / TILE_SIZE;
+        let tiles_y = (height + TILE_SIZE - 1) / TILE_SIZE;
+        let total_tiles = tiles_x * tiles_y;
+        let num_points = pc.num_points();
+
+        {
+            let cam = self.camera.as_mut();
+            let focal = render_settings.camera.projection.focal(render_settings.viewport);
+            cam.set_focal(focal);
+            cam.set_viewport(viewport.cast().unwrap());
+            cam.set_camera(render_settings.camera);
+            self.camera.sync(queue);
+        }
+        {
+            let s = self.render_settings.as_mut();
+            *s = SplattingArgsUniform::from_args_and_pc(render_settings, pc);
+            self.render_settings.sync(queue);
+        }
+        {
+            let t = self.tile_info.as_mut();
+            t.tiles_x = tiles_x;
+            t.tiles_y = tiles_y;
+            t.total_tiles = total_tiles;
+            self.tile_info.sync(queue);
+        }
+        {
+            let t = self.tile_raster_info.as_mut();
+            t.tiles_x = tiles_x;
+            t.tiles_y = tiles_y;
+            t.viewport_w = width;
+            t.viewport_h = height;
+            t.bg_r = render_settings.background_color.r as f32;
+            t.bg_g = render_settings.background_color.g as f32;
+            t.bg_b = render_settings.background_color.b as f32;
+            self.tile_raster_info.sync(queue);
+        }
+        {
+            let p = self.prefix_sum_info.as_mut();
+            p.num_elements = num_points;
+            self.prefix_sum_info.sync(queue);
+        }
+        {
+            let d = self.duplicate_info.as_mut();
+            d.num_visible = num_points;
+            d.tiles_x = tiles_x;
+            self.duplicate_info.sync(queue);
+        }
+        {
+            let v = self.viewport_info.as_mut();
+            v.width = width;
+            v.height = height;
+            self.viewport_info.sync(queue);
+        }
+
+        queue.write_buffer(&self.preprocess_sort_uni, 0, &[0u8; 4]);
+        queue.write_buffer(&self.preprocess_sort_dis, 0, &[0u8; 4]);
+        encoder.clear_buffer(&self.tile_starts_buf, 0, None);
+        encoder.clear_buffer(&self.tile_ends_buf, 0, None);
+        encoder.clear_buffer(&self.tiles_touched_buf, 0, None);
+
+        let wgs_points = (num_points as f32 / 256.0).ceil() as u32;
+
+        // --- Pass 0: Preprocess ---
+        encoder.write_timestamp(&query_set, 0);
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.preprocess_tile_pipeline);
+            pass.set_bind_group(0, self.camera.bind_group(), &[]);
+            pass.set_bind_group(1, pc.bind_group(), &[]);
+            pass.set_bind_group(2, &self.preprocess_sort_bg, &[]);
+            pass.set_bind_group(3, &self.preprocess_tile_bg3, &[]);
+            pass.dispatch_workgroups(wgs_points, 1, 1);
+        }
+        encoder.write_timestamp(&query_set, 1);
+
+        // --- Pass 1: Prefix sum reduce ---
+        encoder.write_timestamp(&query_set, 2);
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.prefix_sum_reduce);
+            pass.set_bind_group(0, &self.prefix_sum_bg, &[]);
+            pass.dispatch_workgroups(wgs_points, 1, 1);
+        }
+        encoder.write_timestamp(&query_set, 3);
+
+        // --- Pass 2: Prefix sum scan blocks ---
+        encoder.write_timestamp(&query_set, 4);
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.prefix_sum_scan_blocks);
+            pass.set_bind_group(0, &self.prefix_sum_bg, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        encoder.write_timestamp(&query_set, 5);
+
+        // --- Pass 3: Prefix sum propagate ---
+        encoder.write_timestamp(&query_set, 6);
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.prefix_sum_propagate);
+            pass.set_bind_group(0, &self.prefix_sum_bg, &[]);
+            pass.dispatch_workgroups(wgs_points, 1, 1);
+        }
+        encoder.write_timestamp(&query_set, 7);
+
+        // --- Pass 4: Update sort info ---
+        encoder.write_timestamp(&query_set, 8);
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.update_sort_info_pipeline);
+            pass.set_bind_group(0, &self.update_sort_info_bg, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        encoder.write_timestamp(&query_set, 9);
+
+        // --- Pass 5: Duplicate keys ---
+        encoder.write_timestamp(&query_set, 10);
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.duplicate_keys_pipeline);
+            pass.set_bind_group(0, &self.duplicate_keys_bg, &[]);
+            pass.dispatch_workgroups(wgs_points, 1, 1);
+        }
+        encoder.write_timestamp(&query_set, 11);
+
+        // --- Pass 6: Radix sort ---
+        encoder.write_timestamp(&query_set, 12);
+        sorter.record_sort_indirect(&self.tile_sort_bg, &self.tile_sort_dis, &mut encoder);
+        encoder.write_timestamp(&query_set, 13);
+
+        // --- Pass 7: Identify ranges ---
+        encoder.write_timestamp(&query_set, 14);
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.identify_ranges_pipeline);
+            pass.set_bind_group(0, &self.identify_ranges_bg, &[]);
+            let wgs = (self.max_tile_entries as f32 / 256.0).ceil() as u32;
+            pass.dispatch_workgroups(wgs.max(1), 1, 1);
+        }
+        encoder.write_timestamp(&query_set, 15);
+
+        // --- Pass 8: Tile raster ---
+        encoder.write_timestamp(&query_set, 16);
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.tile_raster_pipeline);
+            pass.set_bind_group(0, &self.tile_raster_bg, &[]);
+            pass.dispatch_workgroups(tiles_x, tiles_y, 1);
+        }
+        encoder.write_timestamp(&query_set, 17);
+
+        // Resolve timestamps
+        encoder.resolve_query_set(&query_set, 0..NUM_TIMESTAMPS, &resolve_buf, 0);
+        encoder.copy_buffer_to_buffer(&resolve_buf, 0, &readback_buf, 0, (NUM_TIMESTAMPS as u64) * 8);
+
+        queue.submit(Some(encoder.finish()));
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+
+        // Read back timestamps
+        let slice = readback_buf.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).unwrap(); });
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        rx.recv().unwrap().unwrap();
+        let data = slice.get_mapped_range();
+        let timestamps: &[u64] = bytemuck::cast_slice(&data);
+        let period = queue.get_timestamp_period(); // nanoseconds per tick
+
+        let labels = [
+            "preprocess",
+            "prefix_reduce",
+            "prefix_scan_blocks",
+            "prefix_propagate",
+            "update_sort_info",
+            "duplicate_keys",
+            "radix_sort",
+            "identify_ranges",
+            "tile_raster",
+        ];
+
+        log::info!("===== COMPUTE RASTER GPU BENCHMARK =====");
+        let mut total_ns: f64 = 0.0;
+        for (i, label) in labels.iter().enumerate() {
+            let start = timestamps[i * 2];
+            let end = timestamps[i * 2 + 1];
+            let ns = (end.wrapping_sub(start)) as f64 * period as f64;
+            let ms = ns / 1_000_000.0;
+            total_ns += ns;
+            log::info!("  {:20} : {:8.2} ms", label, ms);
+        }
+        log::info!("  {:20} : {:8.2} ms", "TOTAL", total_ns / 1_000_000.0);
+        log::info!("========================================");
     }
 
     fn readback_u32(device: &wgpu::Device, queue: &wgpu::Queue, src: &wgpu::Buffer, offset: u64, label: &str) {
@@ -1094,8 +1354,9 @@ impl TileRasterPipeline {
         queue.write_buffer(&self.preprocess_sort_uni, 0, &[0u8; 4]); // keys_size = 0
         queue.write_buffer(&self.preprocess_sort_dis, 0, &[0u8; 4]); // dispatch_x = 0
 
-        // Zero tile ranges and tiles_touched
-        encoder.clear_buffer(&self.tile_ranges_buf, 0, None);
+        // Zero tile starts/ends and tiles_touched
+        encoder.clear_buffer(&self.tile_starts_buf, 0, None);
+        encoder.clear_buffer(&self.tile_ends_buf, 0, None);
         encoder.clear_buffer(&self.tiles_touched_buf, 0, None);
 
         // Debug sync helper: submit current encoder, poll, log, create new encoder
@@ -1207,7 +1468,8 @@ impl TileRasterPipeline {
         debug_sync!("radix_sort", encoder, debug_device, queue);
 
         // ========== Pass 5: Identify tile ranges ==========
-        // Serial single-threaded scan to avoid Metal vec2 write tearing
+        // Parallel: each thread checks one entry. Safe on Metal because tile_starts
+        // and tile_ends are separate array<u32> buffers (no vec2 partial-write tearing).
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("identify ranges"),
@@ -1215,7 +1477,10 @@ impl TileRasterPipeline {
             });
             pass.set_pipeline(&self.identify_ranges_pipeline);
             pass.set_bind_group(0, &self.identify_ranges_bg, &[]);
-            pass.dispatch_workgroups(1, 1, 1);
+            // Dispatch enough workgroups for max_tile_entries
+            // (actual count is dynamic, shader checks bounds via sort_infos.keys_size)
+            let wgs = (self.max_tile_entries as f32 / 256.0).ceil() as u32;
+            pass.dispatch_workgroups(wgs.max(1), 1, 1);
         }
         debug_sync!("identify_ranges", encoder, debug_device, queue);
 

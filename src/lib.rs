@@ -464,9 +464,6 @@ impl WindowContext {
                 }
 
                 self.wgpu_context.queue.submit([compute_encoder.finish()]);
-                self.wgpu_context.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-                let gpu_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                log::info!("[COMPUTE TIMING] GPU compute: {:.1}ms", gpu_ms);
             }
         } else {
             // Hardware raster path: preprocess + sort
@@ -869,6 +866,18 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
                             state.tile_raster = Some(tr);
                         }
                         state.needs_prepare = true;
+                    }else if key == KeyCode::KeyB && state.compute_raster_enabled {
+                        // Run GPU benchmark for compute raster passes
+                        if let Some(ref mut tr) = state.tile_raster {
+                            log::info!("Running compute raster benchmark...");
+                            tr.prepare_benchmark(
+                                &state.wgpu_context.device,
+                                &state.wgpu_context.queue,
+                                &state.pc,
+                                state.renderer.sorter(),
+                                state.splatting_args,
+                            );
+                        }
                     }else if key == KeyCode::KeyA{
                         state.atlas_enabled = !state.atlas_enabled;
                         log::info!("Atlas texture: {}", if state.atlas_enabled { "enabled" } else { "disabled" });

@@ -2,10 +2,11 @@
 // After radix sort, tile_keys is sorted by (tile_id << 16 | depth).
 // This shader finds where each tile_id starts and ends in the sorted array.
 //
-// Uses a single-threaded serial scan to avoid race conditions on Metal
-// where concurrent writes to .x and .y of the same vec2<u32> can tear.
+// Uses two separate array<u32> buffers (tile_starts, tile_ends) instead of
+// array<vec2<u32>> to avoid Metal MSL race conditions where concurrent writes
+// to .x and .y of the same vec2<u32> can tear.
 //
-// Output: tile_ranges[tile_id] = vec2<u32>(start, end)
+// Output: tile_starts[tile_id] = first index, tile_ends[tile_id] = past-end index
 
 struct SortInfos {
     keys_size: u32,
@@ -18,29 +19,38 @@ struct SortInfos {
 var<storage, read> sorted_keys: array<u32>;
 
 @group(0) @binding(1)
-var<storage, read_write> tile_ranges: array<vec2<u32>>;  // (start, end) per tile
+var<storage, read_write> tile_starts: array<u32>;
 
 @group(0) @binding(2)
+var<storage, read_write> tile_ends: array<u32>;
+
+@group(0) @binding(3)
 var<storage, read> sort_infos: SortInfos;  // reads keys_size = actual total entries
 
-@compute @workgroup_size(1, 1, 1)
-fn main() {
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let num_entries = sort_infos.keys_size;
-    if num_entries == 0u {
+    let idx = gid.x;
+
+    if idx >= num_entries {
         return;
     }
 
-    var prev_tile = sorted_keys[0] >> 16u;
-    tile_ranges[prev_tile] = vec2<u32>(0u, 0u);
+    let curr_tile = sorted_keys[idx] >> 16u;
 
-    for (var i = 1u; i < num_entries; i++) {
-        let curr_tile = sorted_keys[i] >> 16u;
+    if idx == 0u {
+        // First entry: this tile starts at 0
+        tile_starts[curr_tile] = 0u;
+    } else {
+        let prev_tile = sorted_keys[idx - 1u] >> 16u;
         if curr_tile != prev_tile {
-            tile_ranges[prev_tile].y = i;
-            tile_ranges[curr_tile].x = i;
-            prev_tile = curr_tile;
+            tile_ends[prev_tile] = idx;
+            tile_starts[curr_tile] = idx;
         }
     }
 
-    tile_ranges[prev_tile].y = num_entries;
+    if idx == num_entries - 1u {
+        // Last entry: this tile ends at num_entries
+        tile_ends[curr_tile] = num_entries;
+    }
 }

@@ -443,8 +443,8 @@ impl WindowContext {
         // do prepare stuff
 
         if self.compute_raster_enabled {
-            // Compute raster path: single submission for all compute passes
-            {
+            // Compute raster path: skip compute passes if scene unchanged (reuse cached output_buf)
+            if redraw_scene {
                 let mut compute_encoder =
                     self.wgpu_context
                         .device

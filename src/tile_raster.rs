@@ -57,7 +57,7 @@ struct ViewportInfoUniform {
     height: u32,
 }
 
-const TILE_SIZE: u32 = 16;
+const DEFAULT_TILE_SIZE: u32 = 16;
 const MAX_TILES_PER_GAUSSIAN: u32 = 16;
 
 pub struct TileRasterPipeline {
@@ -137,6 +137,7 @@ pub struct TileRasterPipeline {
     kernel_type: u32,
     use_shared_mem: bool,
     aabb_mode: u32,
+    tile_size: u32,
 }
 
 impl TileRasterPipeline {
@@ -153,9 +154,10 @@ impl TileRasterPipeline {
         kernel_type: u32,
         use_shared_mem: bool,
         aabb_mode: u32,
+        tile_size: u32,
     ) -> Self {
-        let tiles_x = (width + TILE_SIZE - 1) / TILE_SIZE;
-        let tiles_y = (height + TILE_SIZE - 1) / TILE_SIZE;
+        let tiles_x = (width + tile_size - 1) / tile_size;
+        let tiles_y = (height + tile_size - 1) / tile_size;
         let total_tiles = tiles_x * tiles_y;
         let max_tile_entries = num_points * MAX_TILES_PER_GAUSSIAN;
 
@@ -616,16 +618,18 @@ impl TileRasterPipeline {
         // Preprocess tile pipeline (select 3DGS or 2DGS shader)
         let preprocess_tile_shader_src = if is_2dgs {
             format!(
-                "const MAX_SH_DEG:u32 = {}u;\nconst KERNEL_TYPE: u32 = {}u;\nconst AABB_MODE: u32 = {}u;\n{}",
+                "const MAX_SH_DEG:u32 = {}u;\nconst KERNEL_TYPE: u32 = {}u;\nconst AABB_MODE: u32 = {}u;\nconst TILE_SIZE: u32 = {}u;\n{}",
                 sh_deg,
                 kernel_type,
                 aabb_mode,
+                tile_size,
                 include_str!("shaders/preprocess_tile_2dgs.wgsl")
             )
         } else {
             format!(
-                "const MAX_SH_DEG:u32 = {}u;\n{}",
+                "const MAX_SH_DEG:u32 = {}u;\nconst TILE_SIZE: u32 = {}u;\n{}",
                 sh_deg,
+                tile_size,
                 include_str!("shaders/preprocess_tile.wgsl")
             )
         };
@@ -745,20 +749,22 @@ impl TileRasterPipeline {
         let use_shmem_val = if use_shared_mem { 1u32 } else { 0u32 };
         let tile_raster_shader_src = if is_2dgs {
             format!(
-                "const KERNEL_TYPE: u32 = {}u;\nconst USE_SHARED_MEM: u32 = {}u;\n{}",
+                "const KERNEL_TYPE: u32 = {}u;\nconst USE_SHARED_MEM: u32 = {}u;\nconst TILE_SIZE: u32 = {}u;\n{}",
                 kernel_type,
                 use_shmem_val,
+                tile_size,
                 include_str!("shaders/tile_raster_2dgs.wgsl")
             )
         } else {
             include_str!("shaders/tile_raster.wgsl").to_string()
         };
-        log::info!("Tile raster kernel_type = {} ({}), shared_mem = {}, aabb_mode = {} ({})",
+        log::info!("Tile raster kernel_type = {} ({}), shared_mem = {}, aabb_mode = {} ({}), tile_size = {}",
             kernel_type,
             match kernel_type { 0 => "Gaussian", 1 => "Beta", 4 => "BetaScaled", _ => "Unknown" },
             use_shared_mem,
             aabb_mode,
-            match aabb_mode { 0 => "Square", 2 => "Rect", 3 => "Rect+AdR", _ => "Unknown" });
+            match aabb_mode { 0 => "Square", 2 => "Rect", 3 => "Rect+AdR", _ => "Unknown" },
+            tile_size);
         let tile_raster_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tile raster shader"),
             source: wgpu::ShaderSource::Wgsl(tile_raster_shader_src.into()),
@@ -920,6 +926,7 @@ impl TileRasterPipeline {
             kernel_type,
             use_shared_mem,
             aabb_mode,
+            tile_size,
         }
     }
 
@@ -933,6 +940,10 @@ impl TileRasterPipeline {
 
     pub fn aabb_mode(&self) -> u32 {
         self.aabb_mode
+    }
+
+    pub fn tile_size(&self) -> u32 {
+        self.tile_size
     }
 
     fn create_tile_raster_bg(
@@ -1084,8 +1095,8 @@ impl TileRasterPipeline {
         let viewport = render_settings.viewport;
         let width = viewport.x;
         let height = viewport.y;
-        let tiles_x = (width + TILE_SIZE - 1) / TILE_SIZE;
-        let tiles_y = (height + TILE_SIZE - 1) / TILE_SIZE;
+        let tiles_x = (width + self.tile_size - 1) / self.tile_size;
+        let tiles_y = (height + self.tile_size - 1) / self.tile_size;
         let total_tiles = tiles_x * tiles_y;
         let num_points = pc.num_points();
 
@@ -1363,8 +1374,8 @@ impl TileRasterPipeline {
         let viewport = render_settings.viewport;
         let width = viewport.x;
         let height = viewport.y;
-        let tiles_x = (width + TILE_SIZE - 1) / TILE_SIZE;
-        let tiles_y = (height + TILE_SIZE - 1) / TILE_SIZE;
+        let tiles_x = (width + self.tile_size - 1) / self.tile_size;
+        let tiles_y = (height + self.tile_size - 1) / self.tile_size;
         let total_tiles = tiles_x * tiles_y;
         let num_points = pc.num_points();
 

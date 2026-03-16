@@ -4,7 +4,7 @@
 
 //const MAX_SH_DEG:u32 = <injected>u;
 
-const TILE_SIZE: u32 = 16u;
+//const TILE_SIZE: u32 = <injected>u;
 const FILTER_SIZE: f32 = 0.707106; // sqrt(2) / 2
 const FILTER_INV_SQUARE: f32 = 2.0; // 1 / (2 * 0.3^2) ... actually = 2.0 per CUDA
 

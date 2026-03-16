@@ -5,7 +5,8 @@
 //   KERNEL_TYPE: 0 = Gaussian, 4 = BetaScaled
 //   USE_SHARED_MEM: 1 = shared memory batching, 0 = direct global reads
 
-const BLOCK_SIZE: u32 = 256u;
+// TILE_SIZE injected at compile time
+const BLOCK_SIZE: u32 = TILE_SIZE * TILE_SIZE;
 const T_THRESHOLD: f32 = 0.0001;
 const FILTER_INV_SQUARE: f32 = 2.0; // 1 / (2 * FilterSize^2) where FilterSize = sqrt(2)/2
 
@@ -78,7 +79,7 @@ var<uniform> tile_info: TileRasterInfo;
 // Shared memory — only allocated when USE_SHARED_MEM == 1
 // When USE_SHARED_MEM == 0, this is still declared but never written/read,
 // so the compiler should optimize it away.
-var<workgroup> sh_splats: array<TileSplat, 256>;
+var<workgroup> sh_splats: array<TileSplat, BLOCK_SIZE>;
 
 // ---- Helper: evaluate one splat against a pixel ----
 fn eval_splat_fields(
@@ -143,14 +144,14 @@ fn eval_splat_fields(
     return vec4<f32>(rg.x * w, rg.y * w, ba.x * w, test_T);
 }
 
-@compute @workgroup_size(16, 16, 1)
+@compute @workgroup_size(TILE_SIZE, TILE_SIZE, 1)
 fn main(
     @builtin(local_invocation_id) local_id: vec3<u32>,
     @builtin(workgroup_id) wg_id: vec3<u32>,
 ) {
     let pix = vec2<u32>(
-        wg_id.x * 16u + local_id.x,
-        wg_id.y * 16u + local_id.y,
+        wg_id.x * TILE_SIZE + local_id.x,
+        wg_id.y * TILE_SIZE + local_id.y,
     );
 
     let vp_w = tile_info.viewport_w;
@@ -164,7 +165,7 @@ fn main(
     let range_end = tile_ends[tile_id];
     let num_gaussians = range_end - range_start;
 
-    let thread_idx = local_id.y * 16u + local_id.x;
+    let thread_idx = local_id.y * TILE_SIZE + local_id.x;
 
     var color = vec3<f32>(0.0);
     var T_acc: f32 = 1.0;

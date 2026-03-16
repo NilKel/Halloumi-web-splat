@@ -195,6 +195,21 @@ pub(crate) fn ui(state: &mut WindowContext) -> bool {
                             }
                         });
                     ui.end_row();
+                    ui.label("Tile Size");
+                    let tile_name = match state.tile_size {
+                        8 => "8x8",
+                        16 => "16x16",
+                        32 => "32x32",
+                        _ => "Unknown",
+                    };
+                    egui::ComboBox::from_id_salt("tile_size")
+                        .selected_text(tile_name)
+                        .show_ui(ui, |ui| {
+                            for (val, name) in [(8u32, "8x8"), (16u32, "16x16"), (32u32, "32x32")] {
+                                ui.selectable_value(&mut state.tile_size, val, name);
+                            }
+                        });
+                    ui.end_row();
                     ui.label("Shared Memory");
                     ui.checkbox(&mut state.use_shared_mem, "");
                     ui.end_row();

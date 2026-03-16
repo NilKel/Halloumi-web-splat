@@ -3,7 +3,7 @@
 // for the compute rasterizer's tile binning pipeline.
 
 const CUTOFF: f32 = 2.3539888583335364; // sqrt(log(255))
-const TILE_SIZE: u32 = 16u;
+//const TILE_SIZE: u32 = <injected>u;
 
 const SH_C0: f32 = 0.28209479177387814;
 const SH_C1 = 0.4886025119029199;

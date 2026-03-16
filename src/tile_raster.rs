@@ -1240,6 +1240,10 @@ impl TileRasterPipeline {
         render_pass.set_bind_group(0, &self.fullscreen_copy_bg, &[]);
         render_pass.draw(0..4, 0..1);
     }
+
+    pub fn output_buf(&self) -> &wgpu::Buffer {
+        &self.output_buf
+    }
 }
 
 // Helper functions for bind group layout entries

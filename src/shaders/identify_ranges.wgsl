@@ -28,9 +28,9 @@ var<storage, read_write> tile_ends: array<u32>;
 var<storage, read> sort_infos: SortInfos;  // reads keys_size = actual total entries
 
 @compute @workgroup_size(256, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
     let num_entries = sort_infos.keys_size;
-    let idx = gid.x;
+    let idx = (wid.x + wid.y * nwg.x) * 256u + lid.x;
 
     if idx >= num_entries {
         return;

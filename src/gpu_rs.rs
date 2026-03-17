@@ -20,6 +20,15 @@ const RS_SCATTER_BLOCK_ROWS: usize = RS_HISTOGRAM_BLOCK_ROWS; // DO NOT CHANGE, 
 const PREFIX_WG_SIZE: usize = 1 << 7; // one thread operates on 2 prefixes at the same time
 const SCATTER_WG_SIZE: usize = 1 << 8;
 
+/// Split a 1D workgroup count into 2D to stay within WebGPU's 65535 limit per dimension.
+fn split_dispatch_2d(total_wgs: u32) -> (u32, u32) {
+    if total_wgs <= 65535 {
+        (total_wgs, 1)
+    } else {
+        (65535, (total_wgs + 65534) / 65535)
+    }
+}
+
 pub struct GPURSSorter {
     bind_group_layout: wgpu::BindGroupLayout,
     render_bind_group_layout: wgpu::BindGroupLayout,
@@ -812,7 +821,8 @@ impl GPURSSorter {
 
             pass.set_pipeline(&self.zero_p);
             pass.set_bind_group(0, bind_group, &[]);
-            pass.dispatch_workgroups(hist_blocks_ru as u32, 1, 1);
+            let (zx, zy) = split_dispatch_2d(hist_blocks_ru as u32);
+            pass.dispatch_workgroups(zx, zy, 1);
         }
 
         {
@@ -823,7 +833,8 @@ impl GPURSSorter {
 
             pass.set_pipeline(&self.histogram_p);
             pass.set_bind_group(0, bind_group, &[]);
-            pass.dispatch_workgroups(hist_blocks_ru as u32, 1, 1);
+            let (hx, hy) = split_dispatch_2d(hist_blocks_ru as u32);
+            pass.dispatch_workgroups(hx, hy, 1);
         }
     }
     pub fn record_calculate_histogram_indirect(
@@ -890,7 +901,8 @@ impl GPURSSorter {
             });
             pass.set_bind_group(0, bind_group, &[]);
             pass.set_pipeline(&self.block_histogram_even_p);
-            pass.dispatch_workgroups(scatter_blocks_ru as u32, 1, 1);
+            let (sx, sy) = split_dispatch_2d(scatter_blocks_ru as u32);
+            pass.dispatch_workgroups(sx, sy, 1);
         }
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -908,7 +920,8 @@ impl GPURSSorter {
             });
             pass.set_bind_group(0, bind_group, &[]);
             pass.set_pipeline(&self.scatter_even_p);
-            pass.dispatch_workgroups(scatter_blocks_ru as u32, 1, 1);
+            let (sx, sy) = split_dispatch_2d(scatter_blocks_ru as u32);
+            pass.dispatch_workgroups(sx, sy, 1);
         }
 
         // Pass 1 (odd)
@@ -919,7 +932,8 @@ impl GPURSSorter {
             });
             pass.set_bind_group(0, bind_group, &[]);
             pass.set_pipeline(&self.block_histogram_odd_p);
-            pass.dispatch_workgroups(scatter_blocks_ru as u32, 1, 1);
+            let (sx, sy) = split_dispatch_2d(scatter_blocks_ru as u32);
+            pass.dispatch_workgroups(sx, sy, 1);
         }
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -937,7 +951,8 @@ impl GPURSSorter {
             });
             pass.set_bind_group(0, bind_group, &[]);
             pass.set_pipeline(&self.scatter_odd_p);
-            pass.dispatch_workgroups(scatter_blocks_ru as u32, 1, 1);
+            let (sx, sy) = split_dispatch_2d(scatter_blocks_ru as u32);
+            pass.dispatch_workgroups(sx, sy, 1);
         }
 
         // Pass 2 (even)
@@ -948,7 +963,8 @@ impl GPURSSorter {
             });
             pass.set_bind_group(0, bind_group, &[]);
             pass.set_pipeline(&self.block_histogram_even_p);
-            pass.dispatch_workgroups(scatter_blocks_ru as u32, 1, 1);
+            let (sx, sy) = split_dispatch_2d(scatter_blocks_ru as u32);
+            pass.dispatch_workgroups(sx, sy, 1);
         }
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -966,7 +982,8 @@ impl GPURSSorter {
             });
             pass.set_bind_group(0, bind_group, &[]);
             pass.set_pipeline(&self.scatter_even_p);
-            pass.dispatch_workgroups(scatter_blocks_ru as u32, 1, 1);
+            let (sx, sy) = split_dispatch_2d(scatter_blocks_ru as u32);
+            pass.dispatch_workgroups(sx, sy, 1);
         }
 
         // Pass 3 (odd)
@@ -977,7 +994,8 @@ impl GPURSSorter {
             });
             pass.set_bind_group(0, bind_group, &[]);
             pass.set_pipeline(&self.block_histogram_odd_p);
-            pass.dispatch_workgroups(scatter_blocks_ru as u32, 1, 1);
+            let (sx, sy) = split_dispatch_2d(scatter_blocks_ru as u32);
+            pass.dispatch_workgroups(sx, sy, 1);
         }
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -995,7 +1013,8 @@ impl GPURSSorter {
             });
             pass.set_bind_group(0, bind_group, &[]);
             pass.set_pipeline(&self.scatter_odd_p);
-            pass.dispatch_workgroups(scatter_blocks_ru as u32, 1, 1);
+            let (sx, sy) = split_dispatch_2d(scatter_blocks_ru as u32);
+            pass.dispatch_workgroups(sx, sy, 1);
         }
     }
     pub fn record_scatter_keys_indirect(

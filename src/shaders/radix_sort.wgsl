@@ -50,6 +50,11 @@ var<private> kr: array<u32, rs_scatter_block_rows>;
 // Helper functions
 // --------------------------------------------------------------------------------------------------------------
 
+// Linearize 2D workgroup ID to support dispatches > 65535 workgroups
+fn linear_wid(wid: vec3<u32>, nwg: vec3<u32>) -> u32 {
+    return wid.x + wid.y * nwg.x;
+}
+
 fn get_scatter_block_kvs() -> u32 {
     return histogram_wg_size * rs_scatter_block_rows;
 }
@@ -87,27 +92,31 @@ fn histogram_store(digit: u32, count: u32) {
 // Phase 0: Zero histograms and pad keys
 // --------------------------------------------------------------------------------------------------------------
 @compute @workgroup_size({histogram_wg_size})
-fn zero_histograms(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
-    if gid.x == 0u {
+fn zero_histograms(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let lwid = linear_wid(wid, nwg);
+    let lgid = lwid * {histogram_wg_size}u + lid.x;
+
+    if lgid == 0u {
         infos.even_pass = 0u;
         infos.odd_pass = 1u;
     }
-    
+
     let scatter_block_kvs = get_scatter_block_kvs();
     let num_blocks = get_num_scatter_blocks(infos.num_keys);
-    
+
     // Total histogram memory to zero:
     // - Global histograms: keyval_size * radix_size
-    // - Block histograms: num_blocks * radix_size  
+    // - Block histograms: num_blocks * radix_size
     // - Block offsets: num_blocks * radix_size
     let total_histogram_size = rs_keyval_size * rs_radix_size + 2u * num_blocks * rs_radix_size;
-    
+
     // Also need to pad keys
     let padding_needed = infos.padded_size - infos.num_keys;
     let total_work = total_histogram_size + padding_needed;
-    
-    let line_size = nwg.x * {histogram_wg_size}u;
-    for (var cur_index = gid.x; cur_index < total_work; cur_index += line_size) {
+
+    let total_wgs = nwg.x * nwg.y;
+    let line_size = total_wgs * {histogram_wg_size}u;
+    for (var cur_index = lgid; cur_index < total_work; cur_index += line_size) {
         if cur_index < total_histogram_size {
             atomicStore(&histograms[cur_index], 0u);
         } else {
@@ -163,9 +172,9 @@ fn calculate_histogram_pass(pass_: u32, lid: u32) {
 }
 
 @compute @workgroup_size({histogram_wg_size})
-fn calculate_histogram(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-    fill_kv_from_keys(wid.x, lid.x);
-    
+fn calculate_histogram(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    fill_kv_from_keys(linear_wid(wid, nwg), lid.x);
+
     // Calculate histograms for all passes
     calculate_histogram_pass(3u, lid.x);
     calculate_histogram_pass(2u, lid.x);
@@ -254,21 +263,23 @@ fn store_block_histogram(pass_: u32, wid: u32, lid: u32, num_blocks: u32) {
 }
 
 @compute @workgroup_size({histogram_wg_size})
-fn calculate_block_histogram_even(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+fn calculate_block_histogram_even(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let lwid = linear_wid(wid, nwg);
     let cur_pass = infos.even_pass * 2u;
     let num_blocks = get_num_scatter_blocks(infos.num_keys);
-    
-    fill_kv_from_keys(wid.x, lid.x);
-    store_block_histogram(cur_pass, wid.x, lid.x, num_blocks);
+
+    fill_kv_from_keys(lwid, lid.x);
+    store_block_histogram(cur_pass, lwid, lid.x, num_blocks);
 }
 
 @compute @workgroup_size({histogram_wg_size})
-fn calculate_block_histogram_odd(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+fn calculate_block_histogram_odd(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let lwid = linear_wid(wid, nwg);
     let cur_pass = infos.odd_pass * 2u + 1u;
     let num_blocks = get_num_scatter_blocks(infos.num_keys);
-    
-    fill_kv_from_keys_b(wid.x, lid.x);
-    store_block_histogram(cur_pass, wid.x, lid.x, num_blocks);
+
+    fill_kv_from_keys_b(lwid, lid.x);
+    store_block_histogram(cur_pass, lwid, lid.x, num_blocks);
 }
 
 // --------------------------------------------------------------------------------------------------------------
@@ -341,7 +352,7 @@ fn fill_kv_pv_even(wid: u32, lid: u32) {
     let subgroup_keyvals = rs_scatter_block_rows * histogram_sg_size;
     let rs_block_keyvals = rs_histogram_block_rows * histogram_wg_size;
     let kv_in_offset = wid * rs_block_keyvals + subgroup_id * subgroup_keyvals + subgroup_invoc_id;
-    
+
     for (var i = 0u; i < rs_histogram_block_rows; i++) {
         let pos = kv_in_offset + i * histogram_sg_size;
         kv[i] = keys[pos];
@@ -358,7 +369,7 @@ fn fill_kv_pv_odd(wid: u32, lid: u32) {
     let subgroup_keyvals = rs_scatter_block_rows * histogram_sg_size;
     let rs_block_keyvals = rs_histogram_block_rows * histogram_wg_size;
     let kv_in_offset = wid * rs_block_keyvals + subgroup_id * subgroup_keyvals + subgroup_invoc_id;
-    
+
     for (var i = 0u; i < rs_histogram_block_rows; i++) {
         let pos = kv_in_offset + i * histogram_sg_size;
         kv[i] = keys_b[pos];
@@ -369,7 +380,7 @@ fn fill_kv_pv_odd(wid: u32, lid: u32) {
     }
 }
 
-fn scatter_phase(pass_: u32, lid: vec3<u32>, wid: vec3<u32>, num_blocks: u32) {
+fn scatter_phase(pass_: u32, lid: vec3<u32>, lwid: u32, num_blocks: u32) {
     let subgroup_id = lid.x / histogram_sg_size;
     let subgroup_offset = subgroup_id * histogram_sg_size;
     let subgroup_tid = lid.x - subgroup_offset;
@@ -424,7 +435,7 @@ fn scatter_phase(pass_: u32, lid: vec3<u32>, wid: vec3<u32>, num_blocks: u32) {
     
     // Step 3: Load pre-computed block offsets into shared memory
     if lid.x < rs_radix_size {
-        let block_offset_idx = block_offsets_offset(num_blocks) + wid.x * rs_radix_size + lid.x;
+        let block_offset_idx = block_offsets_offset(num_blocks) + lwid * rs_radix_size + lid.x;
         scatter_smem[lid.x] = atomicLoad(&histograms[block_offset_idx]);
     }
     workgroupBarrier();
@@ -496,17 +507,19 @@ fn scatter_phase(pass_: u32, lid: vec3<u32>, wid: vec3<u32>, num_blocks: u32) {
 }
 
 @compute @workgroup_size({scatter_wg_size})
-fn scatter_even(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
-    if gid.x == 0u {
+fn scatter_even(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let lwid = linear_wid(wid, nwg);
+    let lgid = lwid * {scatter_wg_size}u + lid.x;
+    if lgid == 0u {
         infos.odd_pass = (infos.odd_pass + 1u) % 2u;
     }
-    
+
     let cur_pass = infos.even_pass * 2u;
     let num_blocks = get_num_scatter_blocks(infos.num_keys);
-    
-    fill_kv_pv_even(wid.x, lid.x);
-    scatter_phase(cur_pass, lid, wid, num_blocks);
-    
+
+    fill_kv_pv_even(lwid, lid.x);
+    scatter_phase(cur_pass, lid, lwid, num_blocks);
+
     // Store to output buffer
     for (var i = 0u; i < rs_scatter_block_rows; i++) {
         keys_b[kr[i]] = kv[i];
@@ -517,16 +530,18 @@ fn scatter_even(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation
 }
 
 @compute @workgroup_size({scatter_wg_size})
-fn scatter_odd(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
-    if gid.x == 0u {
+fn scatter_odd(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let lwid = linear_wid(wid, nwg);
+    let lgid = lwid * {scatter_wg_size}u + lid.x;
+    if lgid == 0u {
         infos.even_pass = (infos.even_pass + 1u) % 2u;
     }
-    
+
     let cur_pass = infos.odd_pass * 2u + 1u;
     let num_blocks = get_num_scatter_blocks(infos.num_keys);
-    
-    fill_kv_pv_odd(wid.x, lid.x);
-    scatter_phase(cur_pass, lid, wid, num_blocks);
+
+    fill_kv_pv_odd(lwid, lid.x);
+    scatter_phase(cur_pass, lid, lwid, num_blocks);
     
     // Store to output buffer
     for (var i = 0u; i < rs_scatter_block_rows; i++) {

@@ -1335,7 +1335,8 @@ impl TileRasterPipeline {
             pass.set_pipeline(&self.identify_ranges_pipeline);
             pass.set_bind_group(0, &self.identify_ranges_bg, &[]);
             let wgs = (self.max_tile_entries as f32 / 256.0).ceil() as u32;
-            pass.dispatch_workgroups(wgs.max(1), 1, 1);
+            let (wx, wy) = if wgs <= 65535 { (wgs.max(1), 1) } else { (65535, (wgs + 65534) / 65535) };
+            pass.dispatch_workgroups(wx, wy, 1);
         });
 
         // --- Pass 8: Tile raster ---
@@ -1650,7 +1651,8 @@ impl TileRasterPipeline {
             // Dispatch enough workgroups for max_tile_entries
             // (actual count is dynamic, shader checks bounds via sort_infos.keys_size)
             let wgs = (self.max_tile_entries as f32 / 256.0).ceil() as u32;
-            pass.dispatch_workgroups(wgs.max(1), 1, 1);
+            let (wx, wy) = if wgs <= 65535 { (wgs.max(1), 1) } else { (65535, (wgs + 65534) / 65535) };
+            pass.dispatch_workgroups(wx, wy, 1);
         }
         debug_sync!("identify_ranges", encoder, debug_device, queue);
 
@@ -1763,11 +1765,17 @@ fn main() {
     let total_entries = tile_offsets[num_visible - 1u];
     tile_sort_infos.keys_size = total_entries;
 
-    // Dispatch X for radix sort = ceil(total_entries / (256 * 15))
+    // Dispatch for radix sort = ceil(total_entries / (256 * 15))
+    // Split into 2D dispatch to stay within WebGPU's 65535 limit per dimension
     let keys_per_wg = 256u * 15u;
-    let dispatch_x = (total_entries + keys_per_wg - 1u) / keys_per_wg;
-    tile_sort_dispatch.dispatch_x = dispatch_x;
-    tile_sort_dispatch.dispatch_y = 1u;
+    let total_wgs = (total_entries + keys_per_wg - 1u) / keys_per_wg;
+    if total_wgs <= 65535u {
+        tile_sort_dispatch.dispatch_x = total_wgs;
+        tile_sort_dispatch.dispatch_y = 1u;
+    } else {
+        tile_sort_dispatch.dispatch_x = 65535u;
+        tile_sort_dispatch.dispatch_y = (total_wgs + 65534u) / 65535u;
+    }
     tile_sort_dispatch.dispatch_z = 1u;
 }
 "#;

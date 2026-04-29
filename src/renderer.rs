@@ -544,6 +544,20 @@ impl GaussianRenderer {
             &queue,
         );
 
+        // Reset sort keys to +∞ so slack slots past `keys_size` (which the
+        // radix sort processes anyway, see `dispatch_x = ceil(keys_size /
+        // keys_per_wg) + 1`) sort to the end and never displace valid splats.
+        // Without this, stale near-camera keys from prior frames produced
+        // flickering "ghost" Gaussians when the camera moved.
+        {
+            let suff = self.sorter_suff.as_ref().unwrap();
+            GPURSSorter::record_reset_sort_keys(
+                encoder,
+                &suff.sort_keys_buffer,
+                &suff.sort_keys_fill,
+            );
+        }
+
         if let Some(stopwatch) = stopwatch {
             stopwatch.start(encoder, "preprocess").unwrap();
         }

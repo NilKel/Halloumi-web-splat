@@ -46,6 +46,10 @@ pub struct PointCloudSortStuff {
     pub(crate) copy_count_bg: Option<wgpu::BindGroup>, // bind group for copy-count compute shader
     pub(crate) sort_keys_buffer: wgpu::Buffer,
     pub(crate) sort_indices_buffer: wgpu::Buffer, // sorted indices (payload_a) for compute rasterizer
+    /// Same size as `sort_keys_buffer`, prefilled with 0xFF bytes once at
+    /// creation. Copied into `sort_keys_buffer` at the start of each frame to
+    /// pad slack slots with `+∞` so they never sort into the visible range.
+    pub(crate) sort_keys_fill: wgpu::Buffer,
 }
 
 #[allow(dead_code)]
@@ -171,6 +175,16 @@ impl GPURSSorter {
             draw_indirect_buffer,
         );
 
+        // Pre-build a 0xFF-filled staging buffer the same size as the sort
+        // keys buffer, used each frame to reset slack slots to +∞ before
+        // preprocess writes valid keys (see `record_reset_sort_keys`).
+        let sort_keys_size = sorter_b_a.size();
+        let sort_keys_fill = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("sort keys fill (0xFF)"),
+            contents: &vec![0xFFu8; sort_keys_size as usize],
+            usage: wgpu::BufferUsages::COPY_SRC,
+        });
+
         PointCloudSortStuff {
             num_points,
             sorter_uni,
@@ -181,6 +195,7 @@ impl GPURSSorter {
             copy_count_bg: None,
             sort_keys_buffer: sorter_b_a,
             sort_indices_buffer: sorter_p_a,
+            sort_keys_fill,
         }
     }
 
@@ -791,6 +806,30 @@ impl GPURSSorter {
     ) {
         queue.write_buffer(indirect_buffer, 0, &[0u8, 0u8, 0u8, 0u8]); // nulling dispatch x
         queue.write_buffer(uniform_buffer, 0, &[0u8, 0u8, 0u8, 0u8]); // nulling keysize
+    }
+
+    /// Reset the sort-keys buffer to `0xFFFFFFFF` (= `f32` +∞ for our
+    /// `bitcast<u32>(zfar - z)` keys) so that any slack slots not written by
+    /// the preprocess this frame sort to the END of the buffer. Without this,
+    /// stale near-camera keys from prior frames remain in
+    /// `[keys_size .. keys_size + keys_per_wg]`, get scattered to the front
+    /// by the radix sort, and appear as flickering "ghost" Gaussians as the
+    /// camera moves.
+    pub fn record_reset_sort_keys(
+        encoder: &mut wgpu::CommandEncoder,
+        sort_keys_buffer: &wgpu::Buffer,
+        sort_keys_fill: &wgpu::Buffer,
+    ) {
+        // `clear_buffer` only zeroes, so we keep a pre-built buffer of
+        // 0xFF bytes and `copy_buffer_to_buffer` it. One staging upload at
+        // PointCloudSortStuff creation, just GPU-side copy each frame.
+        encoder.copy_buffer_to_buffer(
+            sort_keys_fill,
+            0,
+            sort_keys_buffer,
+            0,
+            sort_keys_buffer.size(),
+        );
     }
 
     pub fn record_calculate_histogram(

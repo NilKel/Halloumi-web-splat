@@ -46,13 +46,18 @@ impl SceneCamera {
         let fx = fov2focal(cam.projection.fovx, viewport.x as f32);
         let fy = fov2focal(cam.projection.fovy, viewport.y as f32);
         let rot: Matrix3<f32> = cam.rotation.into();
+        let rotation = [
+            [rot.x.x, rot.y.x, rot.z.x],
+            [rot.x.y, rot.y.y, rot.z.y],
+            [rot.x.z, rot.y.z, rot.z.z],
+        ];
         Self {
             id,
             img_name: name,
             width: viewport.x,
             height: viewport.y,
             position: cam.position.into(),
-            rotation: rot.into(),
+            rotation,
             fx,
             fy,
             split,

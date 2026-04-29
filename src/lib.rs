@@ -84,8 +84,18 @@ impl WGPUContext {
             .unwrap();
         log::info!("using apdater \"{}\"", adapter.get_info().name);
 
+        // BC7 atlas sampling (used by 2DGS baked render) requires
+        // `TEXTURE_COMPRESSION_BC`. Enable opportunistically — the adapter
+        // will report support on every desktop GPU and on Apple Silicon Metal 3+.
+        let bc_supported = adapter.features().contains(wgpu::Features::TEXTURE_COMPRESSION_BC);
+        let bc_feature = if bc_supported {
+            wgpu::Features::TEXTURE_COMPRESSION_BC
+        } else {
+            wgpu::Features::empty()
+        };
+
         #[cfg(target_arch = "wasm32")]
-        let required_features = wgpu::Features::default();
+        let required_features = bc_feature;
         // macOS / Metal does not reliably support `TIMESTAMP_QUERY_INSIDE_ENCODERS`,
         // and on older macOS even `TIMESTAMP_QUERY` itself is unavailable; requesting
         // these as required features makes `request_device` panic. Drop timestamp
@@ -95,10 +105,19 @@ impl WGPUContext {
         let required_features = wgpu::Features::TIMESTAMP_QUERY
             | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
             | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
-            | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+            | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
+            | bc_feature;
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         let required_features = wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
-            | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
+            | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
+            | bc_feature;
+        if !bc_supported {
+            log::warn!(
+                "adapter {:?} does not advertise TEXTURE_COMPRESSION_BC; \
+                 BC7 atlases will fail at PointCloud creation",
+                adapter.get_info().name
+            );
+        }
 
         let adapter_limits = adapter.limits();
 
@@ -246,7 +265,7 @@ impl WindowContext {
             pc_raw.load_atlas_from_bytes(&bytes)?;
             log::info!("loaded atlas from bytes");
         }
-        let pc = PointCloud::new(&device, pc_raw)?;
+        let pc = PointCloud::new(&device, &queue, pc_raw)?;
         log::info!("loaded point cloud with {:} points", pc.num_points());
 
         let renderer = if pc.is_2dgs() {
@@ -350,7 +369,7 @@ impl WindowContext {
             log::info!("reloading volume from {:?}", file_path);
             let file = std::fs::File::open(file_path)?;
             let pc_raw = io::GenericGaussianPointCloud::load(file)?;
-            self.pc = PointCloud::new(&self.wgpu_context.device, pc_raw)?;
+            self.pc = PointCloud::new(&self.wgpu_context.device, &self.wgpu_context.queue, pc_raw)?;
         } else {
             return Err(anyhow::anyhow!("no pointcloud file path present"));
         }
@@ -446,8 +465,10 @@ impl WindowContext {
             }
         }
 
-        let aabb = self.pc.bbox();
-        self.splatting_args.camera.fit_near_far(aabb);
+        if !self.pc.is_2dgs() {
+            let aabb = self.pc.bbox();
+            self.splatting_args.camera.fit_near_far(aabb);
+        }
     }
 
     fn render(

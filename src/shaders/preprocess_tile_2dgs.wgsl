@@ -54,6 +54,9 @@ struct Splat2DGS {
     color_rg: u32,      // R, G (f16 pair)
     color_b_shape: u32, // B, shape (f16 pair)
     gauss_id: u32,      // original Gaussian index
+    depth_u: f32,
+    depth_v: f32,
+    depth_center: f32,
     _pad: u32,
 };
 
@@ -213,7 +216,8 @@ fn eval_sb(gauss_id: u32, view_dir: vec3<f32>) -> vec3<f32> {
 
 // Build 3x3 rotation matrix from quaternion (w, x, y, z)
 fn quat_to_rotmat(q: vec4<f32>) -> mat3x3<f32> {
-    let w = q.x; let x = q.y; let y = q.z; let z = q.w;
+    let qn = q * inverseSqrt(max(dot(q, q), 1e-20));
+    let w = qn.x; let x = qn.y; let y = qn.z; let z = qn.w;
     let x2 = x * x; let y2 = y * y; let z2 = z * z;
     let xy = x * y; let xz = x * z; let yz = y * z;
     let wx = w * x; let wy = w * y; let wz = w * z;
@@ -300,6 +304,8 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>) {
     let R = quat_to_rotmat(rot);
     let L0 = R[0] * sx;  // u-direction in world space
     let L1 = R[1] * sy;  // v-direction in world space
+    let depth_u = (camera.view * vec4<f32>(L0, 0.0)).z;
+    let depth_v = (camera.view * vec4<f32>(L1, 0.0)).z;
 
     // Compute transmat: T = transpose(s2w) * world2ndc * ndc2pix
     // Using explicit vec4 math to avoid mat3x4/mat4x3 types (naga/Metal compatibility).
@@ -325,7 +331,7 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>) {
     proj_raw[1].y = -proj_raw[1].y;
     proj_raw[2].y = -proj_raw[2].y;
     proj_raw[3].y = -proj_raw[3].y;
-    let M = transpose(proj_raw * camera.view);  // world2ndc = (PV)^T
+    let M = proj_raw * camera.view;  // world2ndc = (VP)^T
 
     // Compute intermediate: I = transpose(s2w) * M  (3 rows × 4 cols, stored as 3 vec4 rows)
     // I[i][j] = dot(s2w_row_i, M_col_j). M[j] = column j of (PV)^T = row j of PV.
@@ -468,15 +474,18 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>) {
     let store_idx = atomicAdd(&sort_infos.keys_size, 1u);
 
     splats_2d[store_idx] = Splat2DGS(
-        T_mat[0].x, T_mat[0].y, T_mat[0].z,  // Tu
-        T_mat[1].x, T_mat[1].y, T_mat[1].z,  // Tv
-        T_mat[2].x, T_mat[2].y, T_mat[2].z,  // Tw
+        T_mat[0].x, T_mat[1].x, T_mat[2].x,
+        T_mat[0].y, T_mat[1].y, T_mat[2].y,
+        T_mat[0].z, T_mat[1].z, T_mat[2].z,
         opacity,
         pack2x16float(center_pix),             // pixel-space center
         0u,
         pack2x16float(vec2<f32>(color.r, color.g)),
         pack2x16float(vec2<f32>(color.b, shape)),
         idx,
+        depth_u,
+        depth_v,
+        camspace.z,
         0u,
     );
 

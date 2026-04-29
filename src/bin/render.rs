@@ -87,7 +87,9 @@ async fn render_views(
         });
 
         let mut camera: PerspectiveCamera = s.clone().into();
-        camera.fit_near_far(pc.bbox());
+        if !pc.is_2dgs() {
+            camera.fit_near_far(pc.bbox());
+        }
         renderer.prepare(
             &mut encoder,
             device,
@@ -108,6 +110,13 @@ async fn render_views(
             },
             &mut None,
         );
+        queue.submit(std::iter::once(encoder.finish()));
+        if pc.is_2dgs() {
+            renderer.cpu_sort_visible_2dgs(device, queue).await;
+        }
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("render encoder"),
+        });
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("render pass"),
@@ -115,7 +124,16 @@ async fn render_views(
                     view: &target_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        load: wgpu::LoadOp::Clear(if pc.is_2dgs() {
+                            wgpu::Color {
+                                r: 0.0,
+                                g: 0.0,
+                                b: 0.0,
+                                a: 0.0,
+                            }
+                        } else {
+                            wgpu::Color::BLACK
+                        }),
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -127,7 +145,15 @@ async fn render_views(
             renderer.render(&mut render_pass, &pc);
         }
         queue.submit(std::iter::once(encoder.finish()));
-        let img = download_texture(&target, device, queue).await;
+        let mut img = download_texture(&target, device, queue).await;
+        // Front-to-back premultiplied compositing leaves the RGB channels as
+        // the scene composited over black; set alpha=255 so PNG viewers don't
+        // show the uncovered areas as transparent.
+        if pc.is_2dgs() {
+            for px in img.pixels_mut() {
+                px[3] = 255;
+            }
+        }
         img.save(img_out.join(format!("{i:0>5}.png"))).unwrap();
     }
 }
@@ -158,7 +184,7 @@ async fn main() {
         pc_raw.load_atlas_from_file(atlas).unwrap();
         println!("loaded atlas from '{}'", atlas.to_string_lossy());
     }
-    let mut pc = PointCloud::new(&device, pc_raw).unwrap();
+    let mut pc = PointCloud::new(&device, &queue, pc_raw).unwrap();
 
     let render_format = wgpu::TextureFormat::Rgba16Float;
 
@@ -168,26 +194,20 @@ async fn main() {
         GaussianRenderer::new(&device, &queue, render_format, pc.sh_deg(), pc.compressed()).await
     };
 
-    render_views(
-        device,
-        queue,
-        &mut renderer,
-        &mut pc,
-        scene.cameras(Some(Split::Test)),
-        &opt.img_out,
-        "test",
-    )
-    .await;
-    render_views(
-        device,
-        queue,
-        &mut renderer,
-        &mut pc,
-        scene.cameras(Some(Split::Train)),
-        &opt.img_out,
-        "train",
-    )
-    .await;
+    // Render one test camera. Defaults to the first; HALLOUMI_RENDER_NAME
+    // env var lets callers pick by image name (e.g. DSCF5573) for direct
+    // comparison with a specific CUDA reference.
+    let target_name = std::env::var("HALLOUMI_RENDER_NAME").ok();
+    let test_cams = scene.cameras(Some(Split::Test));
+    let pick = match &target_name {
+        Some(name) => test_cams.iter().find(|c| &c.img_name == name).cloned(),
+        None => None,
+    };
+    let chosen = pick
+        .or_else(|| test_cams.first().cloned())
+        .expect("scene contains no Test-split cameras");
+    println!("rendering test camera id={} img_name={}", chosen.id, chosen.img_name);
+    render_views(device, queue, &mut renderer, &mut pc, vec![chosen], &opt.img_out, "").await;
 
     println!("done!");
 }

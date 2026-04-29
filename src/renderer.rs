@@ -14,35 +14,51 @@ use wgpu::{Extent3d, MultisampleState, include_wgsl};
 
 use cgmath::{EuclideanSpace, Matrix4, Point3, SquareMatrix, Vector2, Vector4};
 
-/// Uniform for tile_raster (what every pixel needs per Gaussian). SB is not
-/// here because it's already folded into the per-Gaussian color by preprocess
-/// (view dir is Gaussian-centric, not pixel-centric). Matches CUDA's final
-/// `feat + d_res_bias` activation + the atlas dequant path. 32 bytes = 2 × vec4.
+/// Uniform for the 2DGS render and compute paths. SB lobes are folded into the
+/// per-Gaussian base color in preprocess (view dir is Gaussian-centric, not
+/// pixel-centric), so they're not in this struct. Matches CUDA's final
+/// `feat + d_res_bias` activation + the BC7 atlas dequant path. 48 bytes.
+///
+/// `atlas_layer_h` is the per-layer height of the BC7 `texture_2d_array`
+/// (the atlas is sliced vertically into N layers — see export_textures_bin.py).
+/// `viewport_w/_h` give the fragment shader pixel-space dimensions so it can
+/// reconstruct splat center pixel coords for the `alpha_lp = exp(-rho2d/2)`
+/// screen-space low-pass that CUDA's `renderBakedCUDA` max-pools with the
+/// kernel falloff (mostly affects sub-pixel splats).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct TexParamsUniform {
     pub atlas_width: u32,
-    pub atlas_height: u32,
+    pub atlas_layer_h: u32,    // BC7: per-layer texture height in pixels
     pub kernel_type: u32,      // 0=Gaussian, 1=Beta, 2=Flex, 3=General, 4=BetaScaled
     pub uv_extent_bits: u32,   // f32 reinterpreted as u32 for uniform alignment
 
-    pub atlas_format: u32,     // 0=FP16 RGB, 1=UINT8 RGBA (dequant via scale/offset)
-    pub atlas_scale: f32,      // UINT8 dequant: residual = u8_norm * scale + offset
-    pub atlas_offset: f32,
+    pub atlas_format: u32,     // 2 = BC7 (only format the renderer supports now)
+    pub atlas_scale: f32,      // residual = sample.rgb * atlas_scale + atlas_offset
+    pub atlas_offset: f32,     // (signed; allows negative residuals)
     pub res_bias: f32,         // final ReLU bias on SH+residual+SB (CUDA d_res_bias)
+
+    pub viewport_w: u32,
+    pub viewport_h: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
 }
 
 impl Default for TexParamsUniform {
     fn default() -> Self {
         Self {
             atlas_width: 0,
-            atlas_height: 0,
+            atlas_layer_h: 0,
             kernel_type: 0,
             uv_extent_bits: 4.0f32.to_bits(),
             atlas_format: 0,
             atlas_scale: 1.0,
             atlas_offset: 0.0,
             res_bias: 0.0,
+            viewport_w: 0,
+            viewport_h: 0,
+            _pad0: 0,
+            _pad1: 0,
         }
     }
 }
@@ -139,7 +155,22 @@ impl GaussianRenderer {
                     entry_point: Some("fs_main"),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: color_format,
-                        blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                        // CUDA's renderer accumulates front-to-back:
+                        // C += color * alpha * T; T *= (1 - alpha).
+                        // The upstream web-splat renderer matches that with
+                        // src = (1 - dst_alpha), dst = 1 for premultiplied output.
+                        blend: Some(wgpu::BlendState {
+                            color: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::OneMinusDstAlpha,
+                                dst_factor: wgpu::BlendFactor::One,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                            alpha: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::OneMinusDstAlpha,
+                                dst_factor: wgpu::BlendFactor::One,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                        }),
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
                     compilation_options: Default::default(),
@@ -237,39 +268,84 @@ impl GaussianRenderer {
         if is_2dgs {
             let tp = UniformBuffer::new(
                 device,
-                TexParamsUniform {
-                    atlas_width: pc.map_or(0, |p| p.atlas_width()),
-                    atlas_height: pc.map_or(0, |p| p.atlas_height()),
-                    kernel_type: pc.map_or(0, |p| p.kernel_type()),
-                    uv_extent_bits: pc.map_or(4.0f32, |p| p.uv_extent()).to_bits(),
-                    atlas_format: pc.map_or(0, |p| p.atlas_format()),
-                    atlas_scale: pc.map_or(1.0, |p| p.atlas_scale()),
-                    atlas_offset: pc.map_or(0.0, |p| p.atlas_offset()),
-                    res_bias: pc.map_or(0.0, |p| p.res_bias()),
+                {
+                    let tp = TexParamsUniform {
+                        atlas_width: pc.map_or(0, |p| p.atlas_width()),
+                        atlas_layer_h: pc.map_or(0, |p| p.atlas_layer_h()),
+                        kernel_type: pc.map_or(0, |p| p.kernel_type()),
+                        uv_extent_bits: pc.map_or(4.0f32, |p| p.uv_extent()).to_bits(),
+                        atlas_format: pc.map_or(0, |p| p.atlas_format()),
+                        atlas_scale: pc.map_or(1.0, |p| p.atlas_scale()),
+                        atlas_offset: pc.map_or(0.0, |p| p.atlas_offset()),
+                        res_bias: pc.map_or(0.0, |p| p.res_bias()),
+                        viewport_w: 0,  // updated each frame in `preprocess`
+                        viewport_h: 0,
+                        _pad0: 0,
+                        _pad1: 0,
+                    };
+                    log::info!(
+                        "2DGS render tex_params: kernel_type={} atlas_format={} \
+                         atlas_w={} atlas_layer_h={} uv_extent={} atlas_scale={} \
+                         atlas_offset={} res_bias={}",
+                        tp.kernel_type, tp.atlas_format, tp.atlas_width,
+                        tp.atlas_layer_h, f32::from_bits(tp.uv_extent_bits),
+                        tp.atlas_scale, tp.atlas_offset, tp.res_bias,
+                    );
+                    tp
                 },
                 Some("tex params uniform buffer"),
             );
 
-            // Create the render bind group for group 3:
-            // binding 0: atlas_texture, binding 1: atlas_rects, binding 2: camera, binding 3: tex_params
+            // Create the render bind group for group 3 (BC7 atlas):
+            // binding 0: texture_2d_array<f32>, binding 1: rects, binding 2: sampler, binding 3: tex_params
             let layout = Self::bind_group_layout_2dgs_render(device);
 
-            // Atlas texture buffer (or dummy)
-            let dummy_atlas;
-            let atlas_resource = if let Some(buf) = pc.and_then(|p| p.atlas_buffer()) {
-                buf.as_entire_binding()
+            // Hold the dummy texture/sampler outside the entries[] block so they
+            // outlive the bind group creation (the BindGroupEntry resource borrows them).
+            let dummy_tex;
+            let dummy_view;
+            let dummy_sampler;
+            let dummy_rects;
+
+            // BC7 texture view, or a 4×4×1 dummy texture so the layout can be
+            // satisfied for scenes loaded without an atlas (atlas_width = 0
+            // makes the shader skip all sampling).
+            let view_resource: wgpu::BindingResource = if let Some(view) =
+                pc.and_then(|p| p.atlas_bc7_view())
+            {
+                wgpu::BindingResource::TextureView(view)
             } else {
-                dummy_atlas = device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("dummy atlas buffer"),
-                    size: 4,
-                    usage: wgpu::BufferUsages::STORAGE,
-                    mapped_at_creation: false,
+                dummy_tex = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("dummy bc7 atlas"),
+                    size: wgpu::Extent3d { width: 4, height: 4, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Bc7RgbaUnorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
                 });
-                dummy_atlas.as_entire_binding()
+                dummy_view = dummy_tex.create_view(&wgpu::TextureViewDescriptor {
+                    dimension: Some(wgpu::TextureViewDimension::D2Array),
+                    ..Default::default()
+                });
+                wgpu::BindingResource::TextureView(&dummy_view)
             };
 
-            // Atlas rects buffer (or dummy)
-            let dummy_rects;
+            let sampler_resource: wgpu::BindingResource = if let Some(s) =
+                pc.and_then(|p| p.atlas_bc7_sampler())
+            {
+                wgpu::BindingResource::Sampler(s)
+            } else {
+                dummy_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+                    label: Some("dummy bc7 sampler"),
+                    mag_filter: wgpu::FilterMode::Linear,
+                    min_filter: wgpu::FilterMode::Linear,
+                    ..Default::default()
+                });
+                wgpu::BindingResource::Sampler(&dummy_sampler)
+            };
+
             let rects_resource = if let Some(buf) = pc.and_then(|p| p.atlas_rects_buffer()) {
                 buf.as_entire_binding()
             } else {
@@ -285,7 +361,7 @@ impl GaussianRenderer {
             let entries = [
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: atlas_resource,
+                    resource: view_resource,
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -293,7 +369,7 @@ impl GaussianRenderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: camera.buffer().as_entire_binding(),
+                    resource: sampler_resource,
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
@@ -302,7 +378,7 @@ impl GaussianRenderer {
             ];
 
             render_tex_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("2dgs render tex bind group"),
+                label: Some("2dgs bc7 render bind group"),
                 layout: &layout,
                 entries: &entries,
             }));
@@ -361,6 +437,15 @@ impl GaussianRenderer {
         *settings_uniform = SplattingArgsUniform::from_args_and_pc(render_settings, pc);
         self.render_settings.sync(queue);
 
+        // Refresh tex_params.viewport so the 2DGS fragment shader can compute
+        // rho2d for `alpha_lp = exp(-rho2d/2)` (CUDA's screen-space low-pass).
+        if let Some(tp) = self.tex_params.as_mut() {
+            let v = tp.as_mut();
+            v.viewport_w = viewport.x;
+            v.viewport_h = viewport.y;
+            tp.sync(queue);
+        }
+
         let depth_buffer = &self.sorter_suff.as_ref().unwrap().sorter_bg_pre;
         self.preprocess.run(
             encoder,
@@ -394,6 +479,51 @@ impl GaussianRenderer {
             rx.receive().await.unwrap()
         };
         return n;
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn debug_sort_info_buffer(&self) -> Option<&wgpu::Buffer> {
+        self.sorter_suff.as_ref().map(|s| &s.sorter_uni)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn debug_sort_indices_buffer(&self) -> Option<&wgpu::Buffer> {
+        self.sorter_suff.as_ref().map(|s| &s.sort_indices_buffer)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn cpu_sort_visible_2dgs(&self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        if !self.is_2dgs {
+            return;
+        }
+        let Some(suff) = self.sorter_suff.as_ref() else {
+            return;
+        };
+        let visible = self.num_visible_points(device, queue).await as usize;
+        if visible == 0 {
+            return;
+        }
+        let keys = {
+            let (tx, rx) = futures_intrusive::channel::shared::oneshot_channel();
+            wgpu::util::DownloadBuffer::read_buffer(
+                device,
+                queue,
+                &suff.sort_keys_buffer.slice(0..(visible as u64 * 4)),
+                move |b| {
+                    let download = b.unwrap();
+                    tx.send(download.as_ref().to_vec()).unwrap();
+                },
+            );
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            rx.receive().await.unwrap()
+        };
+        let mut order = (0..visible as u32).collect::<Vec<_>>();
+        order.sort_by_key(|&idx| {
+            let offset = idx as usize * 4;
+            u32::from_le_bytes(keys[offset..offset + 4].try_into().unwrap())
+        });
+        order.reverse();
+        queue.write_buffer(&suff.sort_indices_buffer, 0, bytemuck::cast_slice(&order));
     }
 
     pub fn prepare(
@@ -434,11 +564,13 @@ impl GaussianRenderer {
         if let Some(stopwatch) = stopwatch {
             stopwatch.start(encoder, "sorting").unwrap();
         }
-        self.sorter.record_sort_indirect(
-            &self.sorter_suff.as_ref().unwrap().sorter_bg,
-            &self.sorter_suff.as_ref().unwrap().sorter_dis,
-            encoder,
-        );
+        if !self.is_2dgs {
+            self.sorter.record_sort_indirect(
+                &self.sorter_suff.as_ref().unwrap().sorter_bg,
+                &self.sorter_suff.as_ref().unwrap().sorter_dis,
+                encoder,
+            );
+        }
         if let Some(stopwatch) = stopwatch {
             stopwatch.stop(encoder, "sorting").unwrap();
         }
@@ -492,21 +624,22 @@ impl GaussianRenderer {
     /// Bind group layout for 2DGS render pass group 3:
     /// binding 0: textures (storage, read), binding 1: camera (uniform), binding 2: tex_params (uniform)
     pub fn bind_group_layout_2dgs_render(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+        // BC7 atlas + 5-stride rects + sampler + tex_params.
         device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("2dgs render bind group layout"),
+            label: Some("2dgs bc7 render bind group layout"),
             entries: &[
-                // binding 0: atlas texture (FP16 packed as u32)
+                // binding 0: BC7 atlas as texture_2d_array<f32>
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
                     },
                     count: None,
                 },
-                // binding 1: atlas rects [N, 4] f32
+                // binding 1: atlas rects [N, 5] f32 (BC7: u0, v0_local, w, h, layer)
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -517,21 +650,19 @@ impl GaussianRenderer {
                     },
                     count: None,
                 },
-                // binding 2: camera uniforms
+                // binding 2: filtering sampler for BC7 atlas
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
-                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
-                // binding 3: tex params (atlas dims, kernel_type, uv_extent)
+                // binding 3: tex params (atlas dims, kernel_type, dequant, res_bias).
+                // Vertex stage reads kernel_type to size the quad correctly for
+                // BetaScaled / Beta kernels (compact-support extent != Gaussian's).
                 wgpu::BindGroupLayoutEntry {
                     binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -611,10 +742,10 @@ struct PreprocessPipeline(wgpu::ComputePipeline);
 
 impl PreprocessPipeline {
     fn new(device: &wgpu::Device, sh_deg: u32, compressed: bool, is_2dgs: bool) -> Self {
-        // 2DGS and 3DGS use the same bind group layout for preprocess
-        // (camera, point cloud, sort, render settings)
+        // 2DGS uses an extended layout that adds sb_params @ binding 3 so the
+        // preprocess shader can fold SB lobes into per-Gaussian color.
         let pc_layout = if is_2dgs {
-            PointCloud::bind_group_layout(device) // surfels use same layout as uncompressed
+            PointCloud::bind_group_layout_2dgs(device)
         } else if compressed {
             PointCloud::bind_group_layout_compressed(device)
         } else {
@@ -1019,7 +1150,7 @@ pub struct SplattingArgsUniform {
     sh_bias: f32,
     compact_mult: f32,
     sb_number: u32,
-    _pad0: u32,
+    kernel_type: u32,
     _pad1: u32,
     _pad2: u32,
 
@@ -1058,6 +1189,7 @@ impl SplattingArgsUniform {
             sh_bias: pc.sh_bias(),
             compact_mult: pc.compact_mult(),
             sb_number: pc.sb_number(),
+            kernel_type: pc.kernel_type(),
             ..Default::default()
         }
     }
@@ -1083,7 +1215,7 @@ impl Default for SplattingArgsUniform {
             sh_bias: 0.5,
             compact_mult: 1.0,
             sb_number: 0,
-            _pad0: 0,
+            kernel_type: 0,
             _pad1: 0,
             _pad2: 0,
         }

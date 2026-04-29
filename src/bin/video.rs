@@ -178,7 +178,7 @@ async fn main() {
 
     println!("reading point cloud file '{}'", opt.input.to_string_lossy());
     let pc_raw = io::GenericGaussianPointCloud::load(&mut ply_file).unwrap();
-    let pc = PointCloud::new(device, pc_raw).unwrap();
+    let pc = PointCloud::new(device, queue, pc_raw).unwrap();
 
     let mut renderer = GaussianRenderer::new(
         device,

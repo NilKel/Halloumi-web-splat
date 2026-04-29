@@ -21,7 +21,13 @@ pub struct PlyReader<R: Read + Seek> {
     num_points: usize,
     num_scales: usize,
     has_shape: bool,
+    num_sb_properties: usize,
     has_gf: usize, // number of gf_* (per-Gaussian feature) properties to skip
+    /// Trailing per-vertex floats we don't consume (e.g. sb_0..11, ap_level
+    /// from nest-splatting's spherical-beta + appearance bakes). Without
+    /// skipping these, every vertex past #0 is read from the wrong byte
+    /// offset and the whole point cloud is scrambled.
+    extra_trailing: usize,
     mip_splatting: Option<bool>,
     kernel_size: Option<f32>,
     kernel_type: Option<u32>,
@@ -37,7 +43,29 @@ impl<R: io::Read + io::Seek> PlyReader<R> {
         let num_points = Self::num_points(&header)?;
         let num_scales = Self::num_scales(&header);
         let has_shape = Self::has_shape(&header);
+        let num_sb_properties = Self::num_sb_properties(&header);
         let has_gf = Self::num_gf_properties(&header);
+        // Total per-vertex float count vs what `read_line_2dgs` / `read_line`
+        // explicitly consume — anything left over (sb_*, ap_level, etc.) must
+        // be skipped at the end of each vertex read.
+        let total_props = header.elements["vertex"].properties.len();
+        let num_coefs = (sh_deg + 1) * (sh_deg + 1);
+        let consumed_2dgs = 3   /* pos */
+                          + 3   /* normals */
+                          + (num_coefs * 3) as usize /* f_dc + f_rest */
+                          + 1   /* opacity */
+                          + num_scales
+                          + 4   /* rot */
+                          + has_gf
+                          + (if has_shape { 1 } else { 0 })
+                          + num_sb_properties;
+        let extra_trailing = total_props.saturating_sub(consumed_2dgs);
+        if extra_trailing > 0 {
+            log::info!(
+                "skipping {extra_trailing} trailing per-vertex floats not consumed \
+                 by the renderer (e.g. sb_*, ap_level)"
+            );
+        }
         let mip_splatting = Self::mip_splatting(&header)?;
         let kernel_size = Self::kernel_size(&header)?;
         let kernel_type = Self::kernel_type(&header)?;
@@ -50,6 +78,13 @@ impl<R: io::Read + io::Seek> PlyReader<R> {
         if has_shape {
             log::info!("detected shape property (kernel_type={:?})", kernel_type);
         }
+        if num_sb_properties > 0 {
+            log::info!(
+                "detected {} spherical-beta properties ({} lobes)",
+                num_sb_properties,
+                num_sb_properties / 6
+            );
+        }
         Ok(Self {
             header,
             reader,
@@ -57,7 +92,9 @@ impl<R: io::Read + io::Seek> PlyReader<R> {
             num_points,
             num_scales,
             has_shape,
+            num_sb_properties,
             has_gf,
+            extra_trailing,
             mip_splatting,
             kernel_size,
             kernel_type,
@@ -107,6 +144,12 @@ impl<R: io::Read + io::Seek> PlyReader<R> {
 
         let cov = build_cov(rot, scale);
 
+        // Skip any trailing per-vertex floats the renderer doesn't use
+        // (e.g. shape, sb_*, ap_level on hybrid bakes).
+        for _ in 0..self.extra_trailing {
+            let _ = self.reader.read_f32::<B>()?;
+        }
+
         return Ok((
             Gaussian::new(
                 Point3::from(pos).cast().unwrap(),
@@ -120,7 +163,7 @@ impl<R: io::Read + io::Seek> PlyReader<R> {
     fn read_line_2dgs<B: ByteOrder>(
         &mut self,
         sh_deg: usize,
-    ) -> anyhow::Result<(Surfel, [[f16; 3]; 16])> {
+    ) -> anyhow::Result<(Surfel, [[f16; 3]; 16], Vec<f32>)> {
         let mut pos = [0.; 3];
         self.reader.read_f32_into::<B>(&mut pos)?;
 
@@ -187,9 +230,22 @@ impl<R: io::Read + io::Seek> PlyReader<R> {
         );
         surfel = surfel.with_shape(f16::from_f32(shape));
 
+        let mut sb_params = vec![0.0; self.num_sb_properties];
+        if self.num_sb_properties > 0 {
+            self.reader.read_f32_into::<B>(&mut sb_params)?;
+        }
+
+        // Skip trailing fields nest-splatting writes after `shape` (sb_0..11
+        // for older files without explicit SB parsing, ap_level for the hashgrid
+        // appearance level, or other future fields).
+        for _ in 0..self.extra_trailing {
+            let _ = self.reader.read_f32::<B>()?;
+        }
+
         Ok((
             surfel,
             sh.map(|x| x.map(|y| f16::from_f32(y))),
+            sb_params,
         ))
     }
 
@@ -203,6 +259,14 @@ impl<R: io::Read + io::Seek> PlyReader<R> {
 
     fn has_shape(header: &ply::Header) -> bool {
         header.elements["vertex"].properties.contains_key("shape")
+    }
+
+    fn num_sb_properties(header: &ply::Header) -> usize {
+        header.elements["vertex"]
+            .properties
+            .keys()
+            .filter(|k| k.starts_with("sb_"))
+            .count()
     }
 
     fn num_gf_properties(header: &ply::Header) -> usize {
@@ -290,23 +354,53 @@ impl<R: io::Read + io::Seek> PointCloudReader for PlyReader<R> {
             // 2DGS surfel format
             let mut surfels = Vec::with_capacity(self.num_points);
             let mut sh_coefs = Vec::with_capacity(self.num_points);
+            let mut sb_params = if self.num_sb_properties > 0 {
+                Some(Vec::with_capacity(self.num_points * self.num_sb_properties))
+            } else {
+                None
+            };
             match self.header.encoding {
                 ply_rs::ply::Encoding::Ascii => todo!("ascii ply format not supported"),
                 ply_rs::ply::Encoding::BinaryBigEndian => {
                     for _ in 0..self.num_points {
-                        let (s, sh) = self.read_line_2dgs::<BigEndian>(self.sh_deg as usize)?;
+                        let (s, sh, sb) = self.read_line_2dgs::<BigEndian>(self.sh_deg as usize)?;
                         surfels.push(s);
                         sh_coefs.push(sh);
+                        if let Some(dst) = &mut sb_params {
+                            dst.extend_from_slice(&sb);
+                        }
                     }
                 }
                 ply_rs::ply::Encoding::BinaryLittleEndian => {
                     for _ in 0..self.num_points {
-                        let (s, sh) = self.read_line_2dgs::<LittleEndian>(self.sh_deg as usize)?;
+                        let (s, sh, sb) = self.read_line_2dgs::<LittleEndian>(self.sh_deg as usize)?;
                         surfels.push(s);
                         sh_coefs.push(sh);
+                        if let Some(dst) = &mut sb_params {
+                            dst.extend_from_slice(&sb);
+                        }
                     }
                 }
             };
+            // Diagnostic: shape min/max/mean across all surfels (post-activation).
+            // For Beta/BetaScaled this should be in [0, 5]; values clustered near
+            // 0 produce flat-disc splats, values near 5 produce sharp bright cores.
+            if self.has_shape && !surfels.is_empty() {
+                let mut smin = f32::INFINITY;
+                let mut smax = f32::NEG_INFINITY;
+                let mut sum = 0.0_f64;
+                for s in &surfels {
+                    let v = f16::to_f32(s.shape);
+                    smin = smin.min(v);
+                    smax = smax.max(v);
+                    sum += v as f64;
+                }
+                log::info!(
+                    "PLY shape (post-activation): min={:.4} max={:.4} mean={:.4} \
+                     across {} surfels",
+                    smin, smax, sum / surfels.len() as f64, surfels.len()
+                );
+            }
             let mut pc = GenericGaussianPointCloud::new_2dgs(
                 surfels,
                 sh_coefs,
@@ -316,7 +410,27 @@ impl<R: io::Read + io::Seek> PointCloudReader for PlyReader<R> {
                 self.mip_splatting,
                 self.background_color,
             );
-            pc.kernel_type = self.kernel_type.unwrap_or(0);
+            pc.kernel_type = self.kernel_type.unwrap_or_else(|| {
+                if self.has_shape {
+                    log::warn!(
+                        "2DGS PLY has a shape field but no kernel_type comment; assuming beta_scaled"
+                    );
+                    4
+                } else {
+                    0
+                }
+            });
+            if let Some(sb) = sb_params {
+                if self.num_sb_properties % 6 == 0 {
+                    pc.sb_number = (self.num_sb_properties / 6) as u32;
+                    pc.sb_params = Some(sb);
+                } else {
+                    log::warn!(
+                        "ignoring {} sb_* properties because the count is not divisible by 6",
+                        self.num_sb_properties
+                    );
+                }
+            }
             return Ok(pc);
         }
 

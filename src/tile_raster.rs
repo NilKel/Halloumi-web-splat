@@ -1101,7 +1101,7 @@ impl TileRasterPipeline {
         {
             let tp = self.tex_params.as_mut();
             tp.atlas_width = pc.atlas_width();
-            tp.atlas_height = pc.atlas_height();
+            tp.atlas_layer_h = pc.atlas_layer_h();
             tp.uv_extent_bits = pc.uv_extent().to_bits();
             tp.kernel_type = pc.kernel_type();
             tp.atlas_format = pc.atlas_format();

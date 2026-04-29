@@ -8,7 +8,7 @@ use std::fmt::Debug;
 use std::mem;
 use wgpu::util::DeviceExt;
 
-use crate::io::GenericGaussianPointCloud;
+use crate::io::{GenericGaussianPointCloud, ATLAS_FORMAT_BC7};
 use crate::uniform::UniformBuffer;
 
 #[repr(C)]
@@ -127,8 +127,17 @@ pub struct PointCloud {
     background_color: Option<wgpu::Color>,
 
     // 2DGS atlas texture support
-    atlas_buffer: Option<wgpu::Buffer>,       // atlas payload (FP16 RGB or UINT8 RGBA) packed as u32
-    atlas_rects_buffer: Option<wgpu::Buffer>, // [N, 4] f32
+    atlas_buffer: Option<wgpu::Buffer>,       // FP16/UINT8 atlas payload packed as u32 (legacy storage path)
+    atlas_rects_buffer: Option<wgpu::Buffer>, // [N, 4] f32 (legacy 4-stride) or [N, 5] f32 (BC7)
+    // BC7 atlas: sampled as a `texture_2d_array<f32>` with format `Bc7RgbaUnorm`.
+    // Each layer holds up to `atlas_layer_h` pixel rows of the original atlas;
+    // `atlas_n_layers` slots cover the full packed atlas. Layer index per rect
+    // is precomputed in `atlas_rects_buffer` (5th f32, see `expand_bc7_rects`).
+    atlas_bc7_texture: Option<wgpu::Texture>,
+    atlas_bc7_view: Option<wgpu::TextureView>,
+    atlas_bc7_sampler: Option<wgpu::Sampler>,
+    atlas_layer_h: u32,
+    atlas_n_layers: u32,
     atlas_width: u32,
     atlas_height: u32,
     atlas_channels: u32,
@@ -161,9 +170,35 @@ impl Debug for PointCloud {
     }
 }
 
+/// Precompute (u0_local, v0_local, w, h, layer_idx) per Gaussian for BC7
+/// atlases — the shader reads the layer index directly instead of binary-
+/// searching `atlas_layer_cuts` per pixel.
+fn expand_bc7_rects(rects: &[f32], cuts: &[u32]) -> Vec<f32> {
+    let n = rects.len() / 4;
+    let mut out = Vec::with_capacity(n * 5);
+    for i in 0..n {
+        let u0       = rects[i * 4 + 0];
+        let v0_glob  = rects[i * 4 + 1];
+        let w        = rects[i * 4 + 2];
+        let h        = rects[i * 4 + 3];
+        let v0_g_u   = v0_glob.floor() as u32;
+        // Find the largest cut <= v0_glob (rect lives entirely inside one layer
+        // by construction: see `_find_layer_cuts` in export_textures_bin.py).
+        let layer = cuts.partition_point(|&c| c <= v0_g_u).saturating_sub(1) as u32;
+        let v0_local = v0_glob - cuts[layer as usize] as f32;
+        out.push(u0);
+        out.push(v0_local);
+        out.push(w);
+        out.push(h);
+        out.push(layer as f32);
+    }
+    out
+}
+
 impl PointCloud {
     pub fn new(
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         pc: GenericGaussianPointCloud,
     ) -> Result<Self, anyhow::Error> {
         let is_2dgs = pc.is_2dgs;
@@ -177,7 +212,7 @@ impl PointCloud {
         let splat_2d_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("2d splats buffer"),
             size: (pc.num_points * splat_size) as u64,
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
@@ -217,6 +252,24 @@ impl PointCloud {
             },
         ];
 
+        // SB params buffer (built early so we can include it in the 2DGS
+        // preprocess bind group at binding 3). For sb_number == 0 we still
+        // create a 16 B dummy so the binding can be satisfied — the shader
+        // checks sb_number from render_settings before reading.
+        let sb_params_buffer_pre = if is_2dgs {
+            let bytes: Vec<u8> = match &pc.sb_params {
+                Some(sb) => bytemuck::cast_slice(sb).to_vec(),
+                None => vec![0u8; 16],
+            };
+            Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("sb params buffer"),
+                contents: &bytes,
+                usage: wgpu::BufferUsages::STORAGE,
+            }))
+        } else {
+            None
+        };
+
         let bind_group = if pc.compressed() {
             let covars_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("Covariances buffer"),
@@ -242,6 +295,17 @@ impl PointCloud {
                 layout: &Self::bind_group_layout_compressed(device),
                 entries: &bind_group_entries,
             })
+        } else if is_2dgs {
+            // 2DGS: bindings 0..2 plus sb_params @ binding 3.
+            bind_group_entries.push(wgpu::BindGroupEntry {
+                binding: 3,
+                resource: sb_params_buffer_pre.as_ref().unwrap().as_entire_binding(),
+            });
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("point cloud bind group (2dgs)"),
+                layout: &Self::bind_group_layout_2dgs(device),
+                entries: &bind_group_entries,
+            })
         } else {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("point cloud bind group"),
@@ -256,6 +320,9 @@ impl PointCloud {
         let mut sb_params_buffer = None;
         let mut surfel_buffer_opt = None;
         let mut surfel_render_bind_group = None;
+        let mut atlas_bc7_texture: Option<wgpu::Texture> = None;
+        let mut atlas_bc7_view: Option<wgpu::TextureView> = None;
+        let mut atlas_bc7_sampler: Option<wgpu::Sampler> = None;
 
         if is_2dgs {
             // Surfel buffer for render pass (need means3D for viewdir)
@@ -275,32 +342,125 @@ impl PointCloud {
             }));
             surfel_buffer_opt = Some(surfel_buf);
 
-            // Atlas texture buffer
-            if let Some(ref atlas_data) = pc.atlas_texture {
-                atlas_buffer = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("atlas texture buffer"),
-                    contents: atlas_data,
-                    usage: wgpu::BufferUsages::STORAGE,
-                }));
-            }
+            // Atlas: BC7 → texture_2d_array<f32> with Bc7RgbaUnorm.
+            //        FP16/UINT8 → legacy storage buffer (unchanged).
+            if pc.atlas_format == ATLAS_FORMAT_BC7 {
+                let atlas_data = pc.atlas_texture.as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("BC7 atlas missing payload"))?;
+                let cuts = &pc.atlas_layer_cuts;
+                if cuts.len() != pc.atlas_n_layers as usize + 1 {
+                    return Err(anyhow::anyhow!(
+                        "BC7 atlas_layer_cuts has {} entries, expected n_layers+1={}",
+                        cuts.len(), pc.atlas_n_layers + 1
+                    ));
+                }
+                let layer_h = pc.atlas_layer_h;
+                let n_layers = pc.atlas_n_layers;
+                let aw = pc.atlas_width;
+                if aw % 4 != 0 || layer_h % 4 != 0 {
+                    return Err(anyhow::anyhow!(
+                        "BC7 dims must be 4-aligned: width={} layer_h={}", aw, layer_h
+                    ));
+                }
+                let blocks_per_row = aw / 4;
+                let bytes_per_block_row = blocks_per_row * 16;
 
-            // Atlas rects buffer
-            if let Some(ref rects) = pc.atlas_rects {
+                let texture = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("bc7 atlas texture"),
+                    size: wgpu::Extent3d {
+                        width: aw,
+                        height: layer_h,
+                        depth_or_array_layers: n_layers,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Bc7RgbaUnorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+
+                // Upload one layer at a time. Layer i covers atlas rows
+                // [cuts[i], cuts[i+1]); slot has `layer_h` rows so we leave the
+                // tail of the last layer uninitialized (no rect samples there).
+                let mut byte_off: usize = 0;
+                for i in 0..n_layers as usize {
+                    let layer_rows = (cuts[i + 1] - cuts[i]) as u32;
+                    let layer_bytes = (layer_rows / 4) as usize * bytes_per_block_row as usize;
+                    queue.write_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d { x: 0, y: 0, z: i as u32 },
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        &atlas_data[byte_off..byte_off + layer_bytes],
+                        wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(bytes_per_block_row),
+                            rows_per_image: Some(layer_rows / 4),
+                        },
+                        wgpu::Extent3d {
+                            width: aw,
+                            height: layer_rows,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                    byte_off += layer_bytes;
+                }
+
+                let view = texture.create_view(&wgpu::TextureViewDescriptor {
+                    label: Some("bc7 atlas view"),
+                    dimension: Some(wgpu::TextureViewDimension::D2Array),
+                    ..Default::default()
+                });
+
+                let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+                    label: Some("bc7 atlas sampler"),
+                    address_mode_u: wgpu::AddressMode::ClampToEdge,
+                    address_mode_v: wgpu::AddressMode::ClampToEdge,
+                    address_mode_w: wgpu::AddressMode::ClampToEdge,
+                    mag_filter: wgpu::FilterMode::Linear,
+                    min_filter: wgpu::FilterMode::Linear,
+                    mipmap_filter: wgpu::FilterMode::Nearest,
+                    ..Default::default()
+                });
+
+                atlas_bc7_texture = Some(texture);
+                atlas_bc7_view = Some(view);
+                atlas_bc7_sampler = Some(sampler);
+
+                // Rects: expand 4-tuple → 5-tuple with precomputed layer index.
+                let rects = pc.atlas_rects.as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("BC7 atlas missing rects"))?;
+                let expanded = expand_bc7_rects(rects, cuts);
                 atlas_rects_buffer = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("atlas rects buffer"),
-                    contents: bytemuck::cast_slice(rects),
+                    label: Some("atlas rects buffer (BC7 5-stride)"),
+                    contents: bytemuck::cast_slice(&expanded),
                     usage: wgpu::BufferUsages::STORAGE,
                 }));
+            } else {
+                // Legacy FP16 RGB / UINT8 RGBA storage-buffer path.
+                if let Some(ref atlas_data) = pc.atlas_texture {
+                    atlas_buffer = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("atlas texture buffer"),
+                        contents: atlas_data,
+                        usage: wgpu::BufferUsages::STORAGE,
+                    }));
+                }
+                if let Some(ref rects) = pc.atlas_rects {
+                    atlas_rects_buffer = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("atlas rects buffer"),
+                        contents: bytemuck::cast_slice(rects),
+                        usage: wgpu::BufferUsages::STORAGE,
+                    }));
+                }
             }
 
-            // Spherical-Beta params buffer (optional). Stored flat as N*K*6 f32.
-            if let Some(ref sb) = pc.sb_params {
-                sb_params_buffer = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("sb params buffer"),
-                    contents: bytemuck::cast_slice(sb),
-                    usage: wgpu::BufferUsages::STORAGE,
-                }));
-            }
+            // sb_params already constructed above (bound into the 2DGS pc bind
+            // group at binding 3 for the preprocess shader). Surface it through
+            // the field so consumers like tile_raster can also access it.
+            sb_params_buffer = sb_params_buffer_pre;
         }
 
         Ok(Self {
@@ -325,6 +485,11 @@ impl PointCloud {
             }),
             atlas_buffer,
             atlas_rects_buffer,
+            atlas_bc7_texture,
+            atlas_bc7_view,
+            atlas_bc7_sampler,
+            atlas_layer_h: pc.atlas_layer_h,
+            atlas_n_layers: pc.atlas_n_layers,
             atlas_width: pc.atlas_width,
             atlas_height: pc.atlas_height,
             atlas_channels: pc.atlas_channels,
@@ -462,6 +627,59 @@ impl PointCloud {
         })
     }
 
+    /// 2DGS preprocess bind group layout. Same as `bind_group_layout` plus
+    /// `sb_params` at binding 3 (storage RO, possibly a 16-byte dummy when
+    /// sb_number == 0). Mirrors the layout the compute tile-raster path uses
+    /// so the hardware preprocess shader can fold SB lobes into per-Gaussian
+    /// color before alpha compositing.
+    pub fn bind_group_layout_2dgs(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("point cloud 2dgs bind group layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        })
+    }
+
     pub fn bind_group_layout_render(device: &wgpu::Device) -> wgpu::BindGroupLayout {
         device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("point cloud rendering bind group layout"),
@@ -513,6 +731,11 @@ impl PointCloud {
         self.is_2dgs
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn debug_splat_2d_buffer(&self) -> &wgpu::Buffer {
+        &self.splat_2d_buffer
+    }
+
     pub fn kernel_type(&self) -> u32 {
         self.kernel_type
     }
@@ -544,6 +767,17 @@ impl PointCloud {
     pub(crate) fn atlas_buffer(&self) -> Option<&wgpu::Buffer> {
         self.atlas_buffer.as_ref()
     }
+
+    pub(crate) fn atlas_bc7_view(&self) -> Option<&wgpu::TextureView> {
+        self.atlas_bc7_view.as_ref()
+    }
+
+    pub(crate) fn atlas_bc7_sampler(&self) -> Option<&wgpu::Sampler> {
+        self.atlas_bc7_sampler.as_ref()
+    }
+
+    pub fn atlas_layer_h(&self) -> u32 { self.atlas_layer_h }
+    pub fn atlas_n_layers(&self) -> u32 { self.atlas_n_layers }
 
     pub(crate) fn atlas_rects_buffer(&self) -> Option<&wgpu::Buffer> {
         self.atlas_rects_buffer.as_ref()
@@ -581,6 +815,7 @@ pub struct Splat2DGS {
     pub color_rg: u32,       // R, G (f16 pair)
     pub color_b_shape: u32,  // B, shape (f16 pair)
     pub gauss_id: u32,       // original Gaussian index (for texture lookup)
+    pub depth_plane: [f32; 3], // camera-space depth = dot(depth_plane, [s.x, s.y, 1])
     pub _pad: u32,           // alignment padding
 }
 

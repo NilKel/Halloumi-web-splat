@@ -61,9 +61,20 @@ pub struct GenericGaussianPointCloud {
     // per-atlas linear dequant: residual = u8_norm * atlas_scale + atlas_offset
     // (matches CUDA's cudaReadModeNormalizedFloat path in forward.cu). 4 B/texel
     // and wgpu can do hardware bilinear via unpack4x8unorm.
+    // 2 = BC7 RGBA, sliced into a `texture_2d_array` of `Bc7RgbaUnorm` layers
+    // (each <= atlas_layer_h pixels tall — typically 16384 to fit Apple/Metal's
+    // max_texture_dimension_2d). Same dequant as UINT8.
     pub atlas_format: u32,
-    pub atlas_scale: f32,       // dequant multiplier (UINT8 path; unused for FP16)
-    pub atlas_offset: f32,      // dequant additive offset (UINT8 path; unused for FP16)
+    pub atlas_scale: f32,       // dequant multiplier (UINT8/BC7; unused for FP16)
+    pub atlas_offset: f32,      // dequant additive offset (UINT8/BC7; unused for FP16)
+
+    // BC7-only: layered texture metadata. atlas_texture holds the concatenated
+    // BC7 byte stream of all layers (in order, each layer is row-major in 4×4
+    // blocks of the full atlas_width). atlas_layer_cuts is `n_layers + 1` long
+    // and gives the global atlas y-coordinates that bound each layer.
+    pub atlas_layer_h: u32,         // texture_2d_array layer dim in pixels (e.g. 16384)
+    pub atlas_n_layers: u32,        // # layers = atlas_layer_cuts.len() - 1
+    pub atlas_layer_cuts: Vec<u32>, // length n_layers + 1; cuts[0] = 0, cuts[n] = atlas_height
 
     // Spherical-Beta (SB) view-dependent lobes. [N, sb_number, 6] f32:
     // per lobe: (r, g, b, theta, phi, beta_raw). Flat length = N * sb_number * 6.
@@ -74,6 +85,7 @@ pub struct GenericGaussianPointCloud {
 /// Atlas texel format constants (stored in NAT2 and TexParams).
 pub const ATLAS_FORMAT_FP16_RGB: u32 = 0;
 pub const ATLAS_FORMAT_UINT8_RGBA: u32 = 1;
+pub const ATLAS_FORMAT_BC7: u32 = 2;
 
 impl GenericGaussianPointCloud {
     pub fn load<'a, R: Read + Seek>(f: R) -> Result<Self, anyhow::Error> {
@@ -149,6 +161,9 @@ impl GenericGaussianPointCloud {
             atlas_format: ATLAS_FORMAT_FP16_RGB,
             atlas_scale: 1.0,
             atlas_offset: 0.0,
+            atlas_layer_h: 0,
+            atlas_n_layers: 0,
+            atlas_layer_cuts: Vec::new(),
             sb_params: None,
             sb_number: 0,
         }
@@ -208,6 +223,9 @@ impl GenericGaussianPointCloud {
             atlas_format: ATLAS_FORMAT_FP16_RGB,
             atlas_scale: 1.0,
             atlas_offset: 0.0,
+            atlas_layer_h: 0,
+            atlas_n_layers: 0,
+            atlas_layer_cuts: Vec::new(),
             sb_params: None,
             sb_number: 0,
         }
@@ -269,6 +287,9 @@ impl GenericGaussianPointCloud {
             atlas_format: ATLAS_FORMAT_FP16_RGB,
             atlas_scale: 1.0,
             atlas_offset: 0.0,
+            atlas_layer_h: 0,
+            atlas_n_layers: 0,
+            atlas_layer_cuts: Vec::new(),
             sb_params: None,
             sb_number: 0,
         }
@@ -322,6 +343,7 @@ impl GenericGaussianPointCloud {
     fn load_atlas_body<R: Read>(&mut self, reader: &mut R, is_v2: bool) -> anyhow::Result<()> {
         let (w, h, c, kernel_type, n, uv_extent);
         let (sb_number, atlas_format, sh_bias, res_bias, compact_mult, atlas_scale, atlas_offset);
+        let (layer_h, n_layers);
 
         if is_v2 {
             let mut header = [0u8; 64];
@@ -338,10 +360,11 @@ impl GenericGaussianPointCloud {
             sh_bias      = f32::from_le_bytes(word(32));
             res_bias     = f32::from_le_bytes(word(36));
             compact_mult = f32::from_le_bytes(word(40));
-            // word(44) = _pad0
+            layer_h      = u32::from_le_bytes(word(44));   // BC7: per-layer texture height
             atlas_scale  = f32::from_le_bytes(word(48));
             atlas_offset = f32::from_le_bytes(word(52));
-            // word(56), word(60) = _pad1, _pad2
+            n_layers     = u32::from_le_bytes(word(56));   // BC7: # layers in texture array
+            // word(60) = _pad2
         } else {
             let mut header = [0u8; 28];
             reader.read_exact(&mut header)?;
@@ -358,8 +381,10 @@ impl GenericGaussianPointCloud {
             sh_bias      = 0.5;
             res_bias     = 0.0;
             compact_mult = 1.0;
+            layer_h      = 0;
             atlas_scale  = 1.0;
             atlas_offset = 0.0;
+            n_layers     = 0;
         }
 
         if n != self.num_points {
@@ -369,16 +394,45 @@ impl GenericGaussianPointCloud {
             ));
         }
 
+        // BC7 layouts have layer_cuts before the rects payload.
+        let mut layer_cuts: Vec<u32> = Vec::new();
+        if atlas_format == ATLAS_FORMAT_BC7 {
+            if n_layers == 0 || layer_h == 0 {
+                return Err(anyhow::anyhow!(
+                    "BC7 atlas requires n_layers>0 and layer_h>0 (got {}, {})",
+                    n_layers, layer_h
+                ));
+            }
+            let mut cuts_bytes = vec![0u8; (n_layers as usize + 1) * 4];
+            reader.read_exact(&mut cuts_bytes)?;
+            layer_cuts = bytemuck::cast_slice::<u8, u32>(&cuts_bytes).to_vec();
+            if *layer_cuts.first().unwrap() != 0 || *layer_cuts.last().unwrap() != h {
+                return Err(anyhow::anyhow!(
+                    "BC7 layer_cuts must start at 0 and end at atlas_height ({}); got {:?}",
+                    h, layer_cuts
+                ));
+            }
+        }
+
         let rects_size = n * 4 * 4;
         let mut rects_bytes = vec![0u8; rects_size];
         reader.read_exact(&mut rects_bytes)?;
         let rects: Vec<f32> = bytemuck::cast_slice(&rects_bytes).to_vec();
 
-        let atlas_size = match atlas_format {
+        let atlas_size: usize = match atlas_format {
             ATLAS_FORMAT_FP16_RGB   => h as usize * w as usize * c as usize * 2,
             ATLAS_FORMAT_UINT8_RGBA => h as usize * w as usize * 4,
+            ATLAS_FORMAT_BC7        => {
+                // 16 B per 4×4 block. Atlas dims are required to be 4-aligned by exporter.
+                if w % 4 != 0 || h % 4 != 0 {
+                    return Err(anyhow::anyhow!(
+                        "BC7 atlas dims must be 4-aligned, got {}x{}", w, h
+                    ));
+                }
+                (h as usize / 4) * (w as usize / 4) * 16
+            }
             _ => return Err(anyhow::anyhow!(
-                "Unknown atlas_format {}, expected 0 (FP16_RGB) or 1 (UINT8_RGBA)",
+                "Unknown atlas_format {}, expected 0 (FP16_RGB), 1 (UINT8_RGBA), or 2 (BC7)",
                 atlas_format
             )),
         };
@@ -394,13 +448,19 @@ impl GenericGaussianPointCloud {
             sb_params = Some(bytemuck::cast_slice(&sb_raw).to_vec());
         }
 
+        let fmt_str = match atlas_format {
+            ATLAS_FORMAT_UINT8_RGBA => "uint8_rgba",
+            ATLAS_FORMAT_BC7        => "bc7",
+            _                       => "fp16_rgb",
+        };
         log::info!(
             "loaded atlas {}x{}x{} (fmt={}), {} rects, kernel_type={}, uv_extent={}, \
              sb_number={}, sh_bias={}, res_bias={}, compact_mult={}, \
-             atlas_scale={}, atlas_offset={} ({:.1} MB)",
-            w, h, c, if atlas_format == ATLAS_FORMAT_UINT8_RGBA { "uint8_rgba" } else { "fp16_rgb" },
+             atlas_scale={}, atlas_offset={}, layer_h={}, n_layers={} ({:.1} MB)",
+            w, h, c, fmt_str,
             n, kernel_type, uv_extent, sb_number,
             sh_bias, res_bias, compact_mult, atlas_scale, atlas_offset,
+            layer_h, n_layers,
             (rects_size + atlas_size + sb_bytes) as f64 / 1e6
         );
 
@@ -417,6 +477,9 @@ impl GenericGaussianPointCloud {
         self.atlas_format = atlas_format;
         self.atlas_scale = atlas_scale;
         self.atlas_offset = atlas_offset;
+        self.atlas_layer_h = layer_h;
+        self.atlas_n_layers = n_layers;
+        self.atlas_layer_cuts = layer_cuts;
         self.sb_params = sb_params;
         self.sb_number = sb_number;
         Ok(())

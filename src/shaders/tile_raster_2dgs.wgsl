@@ -21,6 +21,9 @@ struct Splat2DGS {
     color_rg: u32,
     color_b_shape: u32,
     gauss_id: u32,
+    depth_u: f32,
+    depth_v: f32,
+    depth_center: f32,
     _pad: u32,
 };
 
@@ -34,6 +37,9 @@ struct TileSplat {
     color_rg: u32,
     color_b_shape: u32,
     gauss_id: u32,
+    depth_u: f32,
+    depth_v: f32,
+    depth_center: f32,
 };
 
 struct CameraUniforms {
@@ -86,7 +92,7 @@ var<storage, read> atlas_rects: array<f32>;
 // Mirrors renderer.rs::TexParamsUniform (32 bytes). Must match byte-for-byte.
 struct TexParams {
     atlas_width: u32,
-    atlas_height: u32,
+    atlas_layer_h: u32,
     kernel_type: u32,
     uv_extent_bits: u32,
     atlas_format: u32,     // 0 = FP16 RGB, 1 = UINT8 RGBA (dequant via scale/offset)
@@ -183,7 +189,7 @@ fn eval_splat_fields(
     tv_x: f32, tv_y: f32, tv_z: f32,
     tw_x: f32, tw_y: f32, tw_z: f32,
     opa: f32, pos_packed: u32, color_rg_packed: u32, color_b_shape_packed: u32,
-    gauss_id: u32,
+    gauss_id: u32, depth_u: f32, depth_v: f32, depth_center: f32,
     pixf: vec2<f32>,
     T_acc_in: f32,
 ) -> vec4<f32> {
@@ -207,6 +213,11 @@ fn eval_splat_fields(
     let center_pix = unpack2x16float(pos_packed);
     let d_pix = center_pix - pixf;
     let rho2d = FILTER_INV_SQUARE * dot(d_pix, d_pix);
+
+    let depth = dot(vec3<f32>(depth_u, depth_v, depth_center), vec3<f32>(s, 1.0));
+    if depth < 0.2 {
+        return vec4<f32>(0.0, 0.0, 0.0, -1.0);
+    }
 
     let ba = unpack2x16float(color_b_shape_packed);
 
@@ -316,6 +327,9 @@ fn main(
                     src.color_rg,
                     src.color_b_shape,
                     src.gauss_id,
+                    src.depth_u,
+                    src.depth_v,
+                    src.depth_center,
                 );
             }
             workgroupBarrier();
@@ -337,7 +351,7 @@ fn main(
                     sp.tv_x, sp.tv_y, sp.tv_z,
                     sp.tw_x, sp.tw_y, sp.tw_z,
                     sp.opacity, sp.pos, sp.color_rg, sp.color_b_shape,
-                    sp.gauss_id,
+                    sp.gauss_id, sp.depth_u, sp.depth_v, sp.depth_center,
                     pixf, T_acc,
                 );
 
@@ -366,7 +380,7 @@ fn main(
                     src.tv_x, src.tv_y, src.tv_z,
                     src.tw_x, src.tw_y, src.tw_z,
                     src.opacity, src.pos, src.color_rg, src.color_b_shape,
-                    src.gauss_id,
+                    src.gauss_id, src.depth_u, src.depth_v, src.depth_center,
                     pixf, T_acc,
                 );
 

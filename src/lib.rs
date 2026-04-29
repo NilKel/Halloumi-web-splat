@@ -563,18 +563,6 @@ impl WindowContext {
                 );
 
                 self.wgpu_context.queue.submit([compute_encoder.finish()]);
-
-                // For 2DGS, `prepare()` deliberately skips the GPU radix sort
-                // and we run a CPU sort against the visible-keys buffer so the
-                // front-to-back blend in `render()` sees the right order.
-                // Without this the viewer renders black/garbage on 2DGS scenes.
-                #[cfg(not(target_arch = "wasm32"))]
-                if self.pc.is_2dgs() {
-                    pollster::block_on(self.renderer.cpu_sort_visible_2dgs(
-                        &self.wgpu_context.device,
-                        &self.wgpu_context.queue,
-                    ));
-                }
             }
         }
 

@@ -155,22 +155,13 @@ impl GaussianRenderer {
                     entry_point: Some("fs_main"),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: color_format,
-                        // CUDA's renderer accumulates front-to-back:
-                        // C += color * alpha * T; T *= (1 - alpha).
-                        // The upstream web-splat renderer matches that with
-                        // src = (1 - dst_alpha), dst = 1 for premultiplied output.
-                        blend: Some(wgpu::BlendState {
-                            color: wgpu::BlendComponent {
-                                src_factor: wgpu::BlendFactor::OneMinusDstAlpha,
-                                dst_factor: wgpu::BlendFactor::One,
-                                operation: wgpu::BlendOperation::Add,
-                            },
-                            alpha: wgpu::BlendComponent {
-                                src_factor: wgpu::BlendFactor::OneMinusDstAlpha,
-                                dst_factor: wgpu::BlendFactor::One,
-                                operation: wgpu::BlendOperation::Add,
-                            },
-                        }),
+                        // Back-to-front OVER compositing: the GPU radix sort
+                        // emits `zfar - z` ascending = far→near indices, which
+                        // is the order the rasterizer draws splats in. With
+                        // pre-multiplied source `(color*α, α)` from the fragment
+                        // shader, OVER produces the same result as CUDA's
+                        // near-to-far transmittance accumulation.
+                        blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
                     compilation_options: Default::default(),
@@ -564,13 +555,19 @@ impl GaussianRenderer {
         if let Some(stopwatch) = stopwatch {
             stopwatch.start(encoder, "sorting").unwrap();
         }
-        if !self.is_2dgs {
-            self.sorter.record_sort_indirect(
-                &self.sorter_suff.as_ref().unwrap().sorter_bg,
-                &self.sorter_suff.as_ref().unwrap().sorter_dis,
-                encoder,
-            );
-        }
+        // GPU radix sort runs for both 2DGS and 3DGS (matches commit c49980a,
+        // which is the last Mac-known-working state). The sort produces
+        // ascending `zfar - z` = far→near indices, which pairs with the
+        // back-to-front PREMULTIPLIED_ALPHA_BLENDING blend below. An earlier
+        // experiment skipped the sort for 2DGS and used a CPU sort + a
+        // OneMinusDstAlpha (front-to-back) blend instead — that worked on
+        // Linux/Vulkan but the viewer's render path didn't pick up the CPU
+        // sort, leaving Metal with unsorted indices → black screen.
+        self.sorter.record_sort_indirect(
+            &self.sorter_suff.as_ref().unwrap().sorter_bg,
+            &self.sorter_suff.as_ref().unwrap().sorter_dis,
+            encoder,
+        );
         if let Some(stopwatch) = stopwatch {
             stopwatch.stop(encoder, "sorting").unwrap();
         }

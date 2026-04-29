@@ -111,9 +111,6 @@ async fn render_views(
             &mut None,
         );
         queue.submit(std::iter::once(encoder.finish()));
-        if pc.is_2dgs() {
-            renderer.cpu_sort_visible_2dgs(device, queue).await;
-        }
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("render encoder"),
         });
@@ -146,9 +143,8 @@ async fn render_views(
         }
         queue.submit(std::iter::once(encoder.finish()));
         let mut img = download_texture(&target, device, queue).await;
-        // Front-to-back premultiplied compositing leaves the RGB channels as
-        // the scene composited over black; set alpha=255 so PNG viewers don't
-        // show the uncovered areas as transparent.
+        // Force opaque alpha so PNG viewers don't render the background as
+        // transparent (the cleared regions never had splats over them).
         if pc.is_2dgs() {
             for px in img.pixels_mut() {
                 px[3] = 255;

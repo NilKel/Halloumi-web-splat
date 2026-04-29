@@ -83,12 +83,20 @@ var<storage, read> atlas_texture: array<u32>;
 @group(0) @binding(8)
 var<storage, read> atlas_rects: array<f32>;
 
+// Mirrors renderer.rs::TexParamsUniform (32 bytes). Must match byte-for-byte.
 struct TexParams {
     atlas_width: u32,
     atlas_height: u32,
     kernel_type: u32,
     uv_extent_bits: u32,
+    atlas_format: u32,     // 0 = FP16 RGB, 1 = UINT8 RGBA (dequant via scale/offset)
+    atlas_scale: f32,      // UINT8 dequant: residual = u8_norm * scale + offset
+    atlas_offset: f32,
+    res_bias: f32,         // additive bias before final ReLU (CUDA d_res_bias)
 };
+
+const ATLAS_FORMAT_FP16_RGB: u32 = 0u;
+const ATLAS_FORMAT_UINT8_RGBA: u32 = 1u;
 
 @group(0) @binding(9)
 var<uniform> tex_params: TexParams;
@@ -98,7 +106,7 @@ var<uniform> tex_params: TexParams;
 // so the compiler should optimize it away.
 var<workgroup> sh_splats: array<TileSplat, BLOCK_SIZE>;
 
-// Read a single FP16 value from the atlas texture buffer
+// Read a single FP16 value from the legacy FP16-RGB atlas (6 bytes/texel, 3 chans).
 fn read_atlas_f16(row: i32, col: i32, ch: u32, atlas_w: i32) -> f32 {
     let f16_index = u32(row * atlas_w + col) * 3u + ch;
     let u32_index = f16_index / 2u;
@@ -106,7 +114,19 @@ fn read_atlas_f16(row: i32, col: i32, ch: u32, atlas_w: i32) -> f32 {
     return unpack2x16float(atlas_texture[u32_index])[component];
 }
 
-// Sample atlas with bilinear interpolation at surfel UV
+// Read a UINT8 RGBA texel and dequantize to residual RGB (A channel ignored).
+// Matches CUDA's cudaReadModeNormalizedFloat path:
+//   residual = u8_norm * atlas_scale + atlas_offset.
+fn read_atlas_uint8(row: i32, col: i32, atlas_w: i32) -> vec3<f32> {
+    let word = atlas_texture[u32(row * atlas_w + col)];
+    let norm = unpack4x8unorm(word);  // vec4 in [0, 1]
+    let s = tex_params.atlas_scale;
+    let o = tex_params.atlas_offset;
+    return vec3<f32>(norm.x * s + o, norm.y * s + o, norm.z * s + o);
+}
+
+// Sample atlas with bilinear interpolation at surfel UV. Branches on
+// atlas_format — both paths use the same UV→pixel mapping as CUDA.
 fn sample_atlas(surfel_uv: vec2<f32>, gauss_id: u32) -> vec3<f32> {
     let E = bitcast<f32>(tex_params.uv_extent_bits);
     let r_base = gauss_id * 4u;
@@ -115,6 +135,8 @@ fn sample_atlas(surfel_uv: vec2<f32>, gauss_id: u32) -> vec3<f32> {
     let u_span = atlas_rects[r_base + 2u];
     let v_span = atlas_rects[r_base + 3u];
 
+    // Bake kernel places sample i at s = (i+0.5)*step - E, so invert:
+    //   tex_coord = (s+E)/(2E) * G - 0.5
     let au = u0_px + (surfel_uv.x + E) / (2.0 * E) * u_span - 0.5;
     let av = v0_px + (surfel_uv.y + E) / (2.0 * E) * v_span - 0.5;
     let au_c = clamp(au, u0_px, u0_px + u_span - 1.001);
@@ -128,6 +150,19 @@ fn sample_atlas(surfel_uv: vec2<f32>, gauss_id: u32) -> vec3<f32> {
     let av1 = min(av0 + 1, i32(v0_px + v_span - 1.0));
 
     let aw = i32(tex_params.atlas_width);
+
+    if tex_params.atlas_format == ATLAS_FORMAT_UINT8_RGBA {
+        let c00 = read_atlas_uint8(av0, au0, aw);
+        let c10 = read_atlas_uint8(av0, au1, aw);
+        let c01 = read_atlas_uint8(av1, au0, aw);
+        let c11 = read_atlas_uint8(av1, au1, aw);
+        return (1.0 - fu) * (1.0 - fv) * c00
+             + fu         * (1.0 - fv) * c10
+             + (1.0 - fu) * fv         * c01
+             + fu         * fv         * c11;
+    }
+
+    // Legacy FP16 RGB fallback.
     var residual = vec3<f32>(0.0);
     for (var ch = 0u; ch < 3u; ch++) {
         let c00 = read_atlas_f16(av0, au0, ch, aw);
@@ -177,6 +212,7 @@ fn eval_splat_fields(
 
     var alpha: f32;
     if KERNEL_TYPE == 4u {
+        // BetaScaled kernel (k² = 9). Matches CUDA renderBakedCUDA case 4.
         let shape = ba.y;
         let k_sq = 9.0;
         if rho3d >= k_sq + 1e-6 {
@@ -186,10 +222,26 @@ fn eval_splat_fields(
         let alpha_beta = pow(base, shape);
         let alpha_lp = exp(-rho2d / 2.0);
         alpha = min(0.99, opa * max(alpha_beta, alpha_lp));
-    } else {
-        let alpha_3d = exp(-rho3d);
+    } else if KERNEL_TYPE == 1u {
+        // Beta kernel (k² = 1). Matches CUDA case 1.
+        let shape = ba.y;
+        let k_sq = 1.0;
+        if rho3d >= k_sq + 1e-6 {
+            return vec4<f32>(0.0, 0.0, 0.0, -1.0);
+        }
+        let base = max(0.0, 1.0 - rho3d / k_sq);
+        let alpha_beta = pow(base, shape);
         let alpha_lp = exp(-rho2d / 2.0);
-        alpha = min(0.99, opa * max(alpha_3d, alpha_lp));
+        alpha = min(0.99, opa * max(alpha_beta, alpha_lp));
+    } else {
+        // Standard Gaussian. CUDA uses rho = min(rho3d, rho2d), power = -0.5 * rho,
+        // which is equivalent to max(exp(-rho3d/2), exp(-rho2d/2)). The old Halloumi
+        // path had exp(-rho3d) (no /2) which produced too-sharp falloff.
+        let power = -0.5 * min(rho3d, rho2d);
+        if power > 0.0 {
+            return vec4<f32>(0.0, 0.0, 0.0, -1.0);
+        }
+        alpha = min(0.99, opa * exp(power));
     }
 
     if alpha < 1.0 / 255.0 {
@@ -203,12 +255,18 @@ fn eval_splat_fields(
 
     let w = alpha * T_acc_in;
     let rg = unpack2x16float(color_rg_packed);
+    // color carries clamp(SH + sh_bias, 0) + SB (view-dep lobe contribution),
+    // folded together in preprocess. Tile raster adds residual + res_bias and
+    // then applies the final CUDA per-Gaussian ReLU before compositing.
     var color = vec3<f32>(rg.x, rg.y, ba.x);
 
-    // Atlas texture residual lookup
     if tex_params.atlas_width > 0u {
         color += sample_atlas(s, gauss_id);
     }
+
+    // Final activation: max(0, color + res_bias) per channel. Mirrors CUDA:
+    //   feat[ch] = fmaxf(0.0, feat[ch] + d_res_bias) done once before accumulation.
+    color = max(vec3<f32>(0.0), color + vec3<f32>(tex_params.res_bias));
 
     return vec4<f32>(color.x * w, color.y * w, color.z * w, test_T);
 }

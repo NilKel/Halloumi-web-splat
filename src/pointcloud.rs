@@ -127,13 +127,27 @@ pub struct PointCloud {
     background_color: Option<wgpu::Color>,
 
     // 2DGS atlas texture support
-    atlas_buffer: Option<wgpu::Buffer>,       // [H, W, C] FP16 packed as u32
+    atlas_buffer: Option<wgpu::Buffer>,       // atlas payload (FP16 RGB or UINT8 RGBA) packed as u32
     atlas_rects_buffer: Option<wgpu::Buffer>, // [N, 4] f32
     atlas_width: u32,
     atlas_height: u32,
     atlas_channels: u32,
     uv_extent: f32,
     kernel_type: u32,
+
+    // Bake scalars (from NAT2 header; mirror CUDA d_sh_bias / d_res_bias / d_compact_mult
+    // and the uint8 atlas dequant params).
+    sh_bias: f32,
+    res_bias: f32,
+    compact_mult: f32,
+    atlas_format: u32,
+    atlas_scale: f32,
+    atlas_offset: f32,
+
+    // Spherical-Beta lobes. [N, sb_number, 6] f32; sb_number == 0 means SB is off.
+    sb_params_buffer: Option<wgpu::Buffer>,
+    sb_number: u32,
+
     // Keep surfel buffer accessible for render shader (needs means3D for viewdir)
     surfel_buffer: Option<wgpu::Buffer>,
     surfel_render_bind_group: Option<wgpu::BindGroup>,
@@ -239,6 +253,7 @@ impl PointCloud {
         // 2DGS: create atlas + rects buffers and surfel render bind group
         let mut atlas_buffer = None;
         let mut atlas_rects_buffer = None;
+        let mut sb_params_buffer = None;
         let mut surfel_buffer_opt = None;
         let mut surfel_render_bind_group = None;
 
@@ -277,6 +292,15 @@ impl PointCloud {
                     usage: wgpu::BufferUsages::STORAGE,
                 }));
             }
+
+            // Spherical-Beta params buffer (optional). Stored flat as N*K*6 f32.
+            if let Some(ref sb) = pc.sb_params {
+                sb_params_buffer = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("sb params buffer"),
+                    contents: bytemuck::cast_slice(sb),
+                    usage: wgpu::BufferUsages::STORAGE,
+                }));
+            }
         }
 
         Ok(Self {
@@ -306,6 +330,14 @@ impl PointCloud {
             atlas_channels: pc.atlas_channels,
             uv_extent: pc.uv_extent,
             kernel_type: pc.kernel_type,
+            sh_bias: pc.sh_bias,
+            res_bias: pc.res_bias,
+            compact_mult: pc.compact_mult,
+            atlas_format: pc.atlas_format,
+            atlas_scale: pc.atlas_scale,
+            atlas_offset: pc.atlas_offset,
+            sb_params_buffer,
+            sb_number: pc.sb_number,
             surfel_buffer: surfel_buffer_opt,
             surfel_render_bind_group,
         })
@@ -497,6 +529,14 @@ impl PointCloud {
         self.uv_extent
     }
 
+    pub fn sh_bias(&self) -> f32 { self.sh_bias }
+    pub fn res_bias(&self) -> f32 { self.res_bias }
+    pub fn compact_mult(&self) -> f32 { self.compact_mult }
+    pub fn atlas_format(&self) -> u32 { self.atlas_format }
+    pub fn atlas_scale(&self) -> f32 { self.atlas_scale }
+    pub fn atlas_offset(&self) -> f32 { self.atlas_offset }
+    pub fn sb_number(&self) -> u32 { self.sb_number }
+
     pub(crate) fn splat_2d_buffer(&self) -> &wgpu::Buffer {
         &self.splat_2d_buffer
     }
@@ -507,6 +547,10 @@ impl PointCloud {
 
     pub(crate) fn atlas_rects_buffer(&self) -> Option<&wgpu::Buffer> {
         self.atlas_rects_buffer.as_ref()
+    }
+
+    pub(crate) fn sb_params_buffer(&self) -> Option<&wgpu::Buffer> {
+        self.sb_params_buffer.as_ref()
     }
 
     pub(crate) fn surfel_render_bind_group(&self) -> Option<&wgpu::BindGroup> {

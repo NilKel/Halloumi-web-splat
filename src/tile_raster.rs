@@ -370,45 +370,33 @@ impl TileRasterPipeline {
 
         // ========== Bind group layouts ==========
 
-        // Preprocess tile group 3: render_settings(uniform) + tiles_touched(rw) + rect_data(rw) + depth_16(rw) + tile_info(uniform)
+        // Preprocess tile group 3: render_settings(uniform) + tiles_touched(rw) +
+        // rect_data(rw) + depth_16(rw) + tile_info(uniform) + sb_params(read).
+        // SB lives here so preprocess can bake per-Gaussian view-dependent lobes
+        // into the output color once per visible Gaussian.
         let preprocess_tile_bg3_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("preprocess tile bg3 layout"),
                 entries: &[
-                    uniform_entry(0), // render_settings
+                    uniform_entry(0),    // render_settings
                     storage_rw_entry(1), // tiles_touched
                     storage_rw_entry(2), // rect_data
                     storage_rw_entry(3), // depth_16
-                    uniform_entry(4), // tile_info
+                    uniform_entry(4),    // tile_info
+                    storage_ro_entry(5), // sb_params (dummy buffer when sb_number = 0)
                 ],
             });
 
-        let preprocess_tile_bg3 = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("preprocess tile bg3"),
-            layout: &preprocess_tile_bg3_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: render_settings.buffer().as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: tiles_touched_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: rect_data_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: depth_16_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: tile_info.buffer().as_entire_binding(),
-                },
-            ],
-        });
+        let preprocess_tile_bg3 = Self::create_preprocess_tile_bg3(
+            device,
+            &preprocess_tile_bg3_layout,
+            &render_settings,
+            &tiles_touched_buf,
+            &rect_data_buf,
+            &depth_16_buf,
+            &tile_info,
+            None, // no pc yet — use dummy
+        );
 
         // Prefix sum: data(rw) + block_sums(rw) + info(uniform)
         let prefix_sum_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -524,7 +512,9 @@ impl TileRasterPipeline {
             ],
         });
 
-        // Tile raster: camera(uniform) + splats(read) + tile_payloads(read) + tile_starts(read) + output_buf(rw) + tile_info(uniform) + tile_ends(read)
+        // Tile raster: camera(uniform) + splats(read) + tile_payloads(read) + tile_starts(read) + output_buf(rw) + tile_info(uniform) + tile_ends(read) + atlas(read) + rects(read) + tex_params(uniform)
+        // SB lobes live in the preprocess bind group (view dir is Gaussian-centric,
+        // so we fold SB into the per-Gaussian color once during preprocess).
         let tile_raster_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("tile raster bg layout"),
             entries: &[
@@ -967,6 +957,43 @@ impl TileRasterPipeline {
         tp.atlas_width = if enabled { atlas_width } else { 0 };
     }
 
+    fn create_preprocess_tile_bg3(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        render_settings: &UniformBuffer<SplattingArgsUniform>,
+        tiles_touched: &wgpu::Buffer,
+        rect_data: &wgpu::Buffer,
+        depth_16: &wgpu::Buffer,
+        tile_info: &UniformBuffer<TileInfoUniform>,
+        sb_params_buf: Option<&wgpu::Buffer>,
+    ) -> wgpu::BindGroup {
+        let dummy_sb;
+        let sb_resource = if let Some(buf) = sb_params_buf {
+            buf.as_entire_binding()
+        } else {
+            dummy_sb = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("dummy sb params buffer"),
+                size: 16,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+            dummy_sb.as_entire_binding()
+        };
+
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("preprocess tile bg3"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: render_settings.buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: tiles_touched.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: rect_data.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: depth_16.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: tile_info.buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: sb_resource },
+            ],
+        })
+    }
+
     fn create_tile_raster_bg(
         device: &wgpu::Device,
         layout: &wgpu::BindGroupLayout,
@@ -981,7 +1008,7 @@ impl TileRasterPipeline {
         atlas_buf: Option<&wgpu::Buffer>,
         atlas_rects_buf: Option<&wgpu::Buffer>,
     ) -> wgpu::BindGroup {
-        // Create dummy buffers for missing optional bindings
+        // Create dummy buffers for missing optional bindings.
         let dummy_splat;
         let splat_resource = if let Some(buf) = splat_2d_buf {
             buf.as_entire_binding()
@@ -1070,13 +1097,17 @@ impl TileRasterPipeline {
     }
 
     pub fn update_splat_bind_group(&mut self, device: &wgpu::Device, pc: &PointCloud) {
-        // Update tex_params with atlas info from pointcloud
+        // Update tex_params with atlas + bake-scalar info from pointcloud.
         {
             let tp = self.tex_params.as_mut();
             tp.atlas_width = pc.atlas_width();
             tp.atlas_height = pc.atlas_height();
             tp.uv_extent_bits = pc.uv_extent().to_bits();
             tp.kernel_type = pc.kernel_type();
+            tp.atlas_format = pc.atlas_format();
+            tp.atlas_scale = pc.atlas_scale();
+            tp.atlas_offset = pc.atlas_offset();
+            tp.res_bias = pc.res_bias();
         }
 
         self.tile_raster_bg = Self::create_tile_raster_bg(
@@ -1092,6 +1123,19 @@ impl TileRasterPipeline {
             Some(pc.splat_2d_buffer()),
             pc.atlas_buffer(),
             pc.atlas_rects_buffer(),
+        );
+
+        // Preprocess bg3 needs the SB params buffer; rebuild it whenever the
+        // point cloud changes since the SB storage slot is a storage buffer.
+        self.preprocess_tile_bg3 = Self::create_preprocess_tile_bg3(
+            device,
+            &self.preprocess_tile_bg3_layout,
+            &self.render_settings,
+            &self.tiles_touched_buf,
+            &self.rect_data_buf,
+            &self.depth_16_buf,
+            &self.tile_info,
+            pc.sb_params_buffer(),
         );
     }
 

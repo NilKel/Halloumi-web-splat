@@ -37,12 +37,20 @@ struct SortInfos {
     odd_pass: u32,
 };
 
+// Mirrors renderer.rs::TexParamsUniform (32 bytes). Must match byte-for-byte.
 struct TexParams {
     atlas_width: u32,
     atlas_height: u32,
     kernel_type: u32,
     uv_extent_bits: u32,
+    atlas_format: u32,     // 0 = FP16 RGB, 1 = UINT8 RGBA (dequant via scale/offset)
+    atlas_scale: f32,      // UINT8 dequant: residual = u8_norm * scale + offset
+    atlas_offset: f32,
+    res_bias: f32,         // additive bias before final ReLU (CUDA d_res_bias)
 };
+
+const ATLAS_FORMAT_FP16_RGB: u32 = 0u;
+const ATLAS_FORMAT_UINT8_RGBA: u32 = 1u;
 
 // Group 0: splat_2d buffer (binding 2)
 @group(0) @binding(2)
@@ -144,28 +152,55 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let au1 = min(au0 + 1, i32(u0_px + u_span - 1.0));
         let av1 = min(av0 + 1, i32(v0_px + v_span - 1.0));
 
-        // Bilinear interpolation from atlas (3 channels, FP16 packed as u32)
+        // Bilinear interpolation. Branch on atlas format — UINT8 RGBA packs
+        // one texel per u32 (unpack4x8unorm, dequant via scale/offset), FP16
+        // RGB packs 3 f16 per 1.5 u32 (legacy unpack2x16float path).
         let aw = i32(atlas_w);
-        for (var ch = 0u; ch < 3u; ch++) {
-            let c00 = read_atlas_f16(av0, au0, ch, aw);
-            let c10 = read_atlas_f16(av0, au1, ch, aw);
-            let c01 = read_atlas_f16(av1, au0, ch, aw);
-            let c11 = read_atlas_f16(av1, au1, ch, aw);
-            color[ch] += (1.0 - fu) * (1.0 - fv) * c00
-                       + fu * (1.0 - fv) * c10
-                       + (1.0 - fu) * fv * c01
-                       + fu * fv * c11;
+        if tex_params.atlas_format == ATLAS_FORMAT_UINT8_RGBA {
+            let c00 = read_atlas_uint8(av0, au0, aw);
+            let c10 = read_atlas_uint8(av0, au1, aw);
+            let c01 = read_atlas_uint8(av1, au0, aw);
+            let c11 = read_atlas_uint8(av1, au1, aw);
+            color += (1.0 - fu) * (1.0 - fv) * c00
+                   + fu         * (1.0 - fv) * c10
+                   + (1.0 - fu) * fv         * c01
+                   + fu         * fv         * c11;
+        } else {
+            for (var ch = 0u; ch < 3u; ch++) {
+                let c00 = read_atlas_f16(av0, au0, ch, aw);
+                let c10 = read_atlas_f16(av0, au1, ch, aw);
+                let c01 = read_atlas_f16(av1, au0, ch, aw);
+                let c11 = read_atlas_f16(av1, au1, ch, aw);
+                color[ch] += (1.0 - fu) * (1.0 - fv) * c00
+                           + fu * (1.0 - fv) * c10
+                           + (1.0 - fu) * fv * c01
+                           + fu * fv * c11;
+            }
         }
     }
+
+    // Final activation: max(0, color + res_bias) per channel. Mirrors CUDA's
+    // per-Gaussian ReLU right before alpha compositing.
+    color = max(vec3<f32>(0.0), color + vec3<f32>(tex_params.res_bias));
 
     // Premultiplied alpha output
     return vec4<f32>(color, 1.0) * b;
 }
 
-// Read a single FP16 value from the atlas texture buffer
+// Read a single FP16 value from the legacy FP16 RGB atlas (6 B/texel, 3 chans).
 fn read_atlas_f16(row: i32, col: i32, ch: u32, atlas_w: i32) -> f32 {
     let f16_index = u32(row * atlas_w + col) * 3u + ch;
     let u32_index = f16_index / 2u;
     let component = f16_index % 2u;
     return unpack2x16float(atlas_texture[u32_index])[component];
+}
+
+// Read a UINT8 RGBA texel and dequantize to residual RGB. Matches CUDA's
+// cudaReadModeNormalizedFloat path: residual = u8_norm * atlas_scale + atlas_offset.
+fn read_atlas_uint8(row: i32, col: i32, atlas_w: i32) -> vec3<f32> {
+    let word = atlas_texture[u32(row * atlas_w + col)];
+    let norm = unpack4x8unorm(word);
+    let s = tex_params.atlas_scale;
+    let o = tex_params.atlas_offset;
+    return vec3<f32>(norm.x * s + o, norm.y * s + o, norm.z * s + o);
 }

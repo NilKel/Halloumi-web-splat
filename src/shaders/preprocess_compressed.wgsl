@@ -95,7 +95,14 @@ struct RenderSettings {
     kernel_size: f32,
     walltime: f32,
     scene_extend: f32,
-    center: vec3<f32>,
+    // Bake scalars — unused by this shader but layout must match Rust side.
+    sh_bias: f32,
+    compact_mult: f32,
+    sb_number: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+    center: vec4<f32>,
 }
 
 

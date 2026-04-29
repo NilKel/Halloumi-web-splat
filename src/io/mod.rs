@@ -50,7 +50,30 @@ pub struct GenericGaussianPointCloud {
     pub atlas_channels: u32,
     pub uv_extent: f32,
     pub kernel_type: u32,
+
+    // Training-time activation + Compact Box knobs — must match the CUDA bake
+    // (diff_surfel_bake_render forward.cu uses these via d_sh_bias / d_res_bias / d_compact_mult).
+    pub sh_bias: f32,          // additive constant on SH eval before ReLU (default 0.5)
+    pub res_bias: f32,          // additive constant on final (SH+residual+SB) before ReLU (default 0.0)
+    pub compact_mult: f32,      // FastGS Compact Box multiplier on AdR r_lp (default 1.0)
+
+    // Atlas texel format. 0 = FP16 RGB (legacy, 6 B/texel). 1 = UINT8 RGBA with
+    // per-atlas linear dequant: residual = u8_norm * atlas_scale + atlas_offset
+    // (matches CUDA's cudaReadModeNormalizedFloat path in forward.cu). 4 B/texel
+    // and wgpu can do hardware bilinear via unpack4x8unorm.
+    pub atlas_format: u32,
+    pub atlas_scale: f32,       // dequant multiplier (UINT8 path; unused for FP16)
+    pub atlas_offset: f32,      // dequant additive offset (UINT8 path; unused for FP16)
+
+    // Spherical-Beta (SB) view-dependent lobes. [N, sb_number, 6] f32:
+    // per lobe: (r, g, b, theta, phi, beta_raw). Flat length = N * sb_number * 6.
+    pub sb_params: Option<Vec<f32>>,
+    pub sb_number: u32,         // number of SB lobes per Gaussian (0 = SB disabled)
 }
+
+/// Atlas texel format constants (stored in NAT2 and TexParams).
+pub const ATLAS_FORMAT_FP16_RGB: u32 = 0;
+pub const ATLAS_FORMAT_UINT8_RGBA: u32 = 1;
 
 impl GenericGaussianPointCloud {
     pub fn load<'a, R: Read + Seek>(f: R) -> Result<Self, anyhow::Error> {
@@ -120,6 +143,14 @@ impl GenericGaussianPointCloud {
             atlas_channels: 0,
             uv_extent: 4.0,
             kernel_type: 0,
+            sh_bias: 0.5,
+            res_bias: 0.0,
+            compact_mult: 1.0,
+            atlas_format: ATLAS_FORMAT_FP16_RGB,
+            atlas_scale: 1.0,
+            atlas_offset: 0.0,
+            sb_params: None,
+            sb_number: 0,
         }
     }
 
@@ -171,6 +202,14 @@ impl GenericGaussianPointCloud {
             atlas_channels: 0,
             uv_extent: 4.0,
             kernel_type: 0,
+            sh_bias: 0.5,
+            res_bias: 0.0,
+            compact_mult: 1.0,
+            atlas_format: ATLAS_FORMAT_FP16_RGB,
+            atlas_scale: 1.0,
+            atlas_offset: 0.0,
+            sb_params: None,
+            sb_number: 0,
         }
     }
 
@@ -224,6 +263,14 @@ impl GenericGaussianPointCloud {
             atlas_channels: 0,
             uv_extent: 4.0,
             kernel_type: 0,
+            sh_bias: 0.5,
+            res_bias: 0.0,
+            compact_mult: 1.0,
+            atlas_format: ATLAS_FORMAT_FP16_RGB,
+            atlas_scale: 1.0,
+            atlas_offset: 0.0,
+            sb_params: None,
+            sb_number: 0,
         }
     }
 
@@ -257,27 +304,63 @@ impl GenericGaussianPointCloud {
 }
 
 impl GenericGaussianPointCloud {
-    /// Load atlas textures from a NATL binary file.
-    /// Format: [magic "NATL" 4B] [W: u32] [H: u32] [C: u32] [kernel_type: u32]
-    ///         [N: u32] [uv_extent: f32] [pad: u32]
-    ///         [rects: N*4 f32] [atlas: H*W*C FP16]
-    pub fn load_atlas_from_file(&mut self, path: &Path) -> anyhow::Result<()> {
-        use std::io::Read as _;
-        let mut file = std::fs::File::open(path)?;
-        let mut magic = [0u8; 4];
-        file.read_exact(&mut magic)?;
-        if &magic != b"NATL" {
-            return Err(anyhow::anyhow!("Invalid atlas file magic (expected NATL)"));
+    /// Read the body of a NATL/NAT2 stream (after the 4-byte magic).
+    ///
+    /// NATL (v1, legacy) header, 28 B:
+    ///   [W H C kernel_type] [N uv_extent _pad] (7 × 4B).
+    ///   Atlas payload = H*W*C*2 B (FP16 RGB). No SB block.
+    ///
+    /// NAT2 (v2, current) header, 64 B post-magic, laid out as 16 × 4B words:
+    ///   0: W, 1: H, 2: C, 3: kernel_type,
+    ///   4: N, 5: uv_extent (f32), 6: sb_number, 7: atlas_format,
+    ///   8: sh_bias (f32), 9: res_bias (f32), 10: compact_mult (f32), 11: _pad0,
+    ///   12: atlas_scale (f32), 13: atlas_offset (f32), 14: _pad1, 15: _pad2.
+    /// Atlas payload size depends on atlas_format:
+    ///   FP16_RGB   (0): H*W*C*2 B
+    ///   UINT8_RGBA (1): H*W*4   B
+    /// SB block follows atlas when sb_number > 0: N*sb_number*6*4 B of f32.
+    fn load_atlas_body<R: Read>(&mut self, reader: &mut R, is_v2: bool) -> anyhow::Result<()> {
+        let (w, h, c, kernel_type, n, uv_extent);
+        let (sb_number, atlas_format, sh_bias, res_bias, compact_mult, atlas_scale, atlas_offset);
+
+        if is_v2 {
+            let mut header = [0u8; 64];
+            reader.read_exact(&mut header)?;
+            let word = |i: usize| [header[i], header[i+1], header[i+2], header[i+3]];
+            w            = u32::from_le_bytes(word(0));
+            h            = u32::from_le_bytes(word(4));
+            c            = u32::from_le_bytes(word(8));
+            kernel_type  = u32::from_le_bytes(word(12));
+            n            = u32::from_le_bytes(word(16)) as usize;
+            uv_extent    = f32::from_le_bytes(word(20));
+            sb_number    = u32::from_le_bytes(word(24));
+            atlas_format = u32::from_le_bytes(word(28));
+            sh_bias      = f32::from_le_bytes(word(32));
+            res_bias     = f32::from_le_bytes(word(36));
+            compact_mult = f32::from_le_bytes(word(40));
+            // word(44) = _pad0
+            atlas_scale  = f32::from_le_bytes(word(48));
+            atlas_offset = f32::from_le_bytes(word(52));
+            // word(56), word(60) = _pad1, _pad2
+        } else {
+            let mut header = [0u8; 28];
+            reader.read_exact(&mut header)?;
+            let word = |i: usize| [header[i], header[i+1], header[i+2], header[i+3]];
+            w            = u32::from_le_bytes(word(0));
+            h            = u32::from_le_bytes(word(4));
+            c            = u32::from_le_bytes(word(8));
+            kernel_type  = u32::from_le_bytes(word(12));
+            n            = u32::from_le_bytes(word(16)) as usize;
+            uv_extent    = f32::from_le_bytes(word(20));
+            // Legacy defaults — matches the old hardcoded Halloumi activation path.
+            sb_number    = 0;
+            atlas_format = ATLAS_FORMAT_FP16_RGB;
+            sh_bias      = 0.5;
+            res_bias     = 0.0;
+            compact_mult = 1.0;
+            atlas_scale  = 1.0;
+            atlas_offset = 0.0;
         }
-        let mut header = [0u8; 28]; // 7 × u32
-        file.read_exact(&mut header)?;
-        let w = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
-        let h = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
-        let c = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
-        let kernel_type = u32::from_le_bytes([header[12], header[13], header[14], header[15]]);
-        let n = u32::from_le_bytes([header[16], header[17], header[18], header[19]]) as usize;
-        let uv_extent = f32::from_le_bytes([header[20], header[21], header[22], header[23]]);
-        // header[24..28] is padding
 
         if n != self.num_points {
             return Err(anyhow::anyhow!(
@@ -286,21 +369,39 @@ impl GenericGaussianPointCloud {
             ));
         }
 
-        // Read rects: N * 4 * 4 bytes (f32)
         let rects_size = n * 4 * 4;
         let mut rects_bytes = vec![0u8; rects_size];
-        file.read_exact(&mut rects_bytes)?;
+        reader.read_exact(&mut rects_bytes)?;
         let rects: Vec<f32> = bytemuck::cast_slice(&rects_bytes).to_vec();
 
-        // Read atlas: H * W * C * 2 bytes (FP16)
-        let atlas_size = h as usize * w as usize * c as usize * 2;
+        let atlas_size = match atlas_format {
+            ATLAS_FORMAT_FP16_RGB   => h as usize * w as usize * c as usize * 2,
+            ATLAS_FORMAT_UINT8_RGBA => h as usize * w as usize * 4,
+            _ => return Err(anyhow::anyhow!(
+                "Unknown atlas_format {}, expected 0 (FP16_RGB) or 1 (UINT8_RGBA)",
+                atlas_format
+            )),
+        };
         let mut atlas_data = vec![0u8; atlas_size];
-        file.read_exact(&mut atlas_data)?;
+        reader.read_exact(&mut atlas_data)?;
+
+        let mut sb_params: Option<Vec<f32>> = None;
+        let mut sb_bytes = 0usize;
+        if sb_number > 0 {
+            sb_bytes = n * sb_number as usize * 6 * 4;
+            let mut sb_raw = vec![0u8; sb_bytes];
+            reader.read_exact(&mut sb_raw)?;
+            sb_params = Some(bytemuck::cast_slice(&sb_raw).to_vec());
+        }
 
         log::info!(
-            "loaded atlas {}x{}x{}, {} rects, kernel_type={}, uv_extent={} ({:.1} MB)",
-            w, h, c, n, kernel_type, uv_extent,
-            (rects_size + atlas_size) as f64 / 1e6
+            "loaded atlas {}x{}x{} (fmt={}), {} rects, kernel_type={}, uv_extent={}, \
+             sb_number={}, sh_bias={}, res_bias={}, compact_mult={}, \
+             atlas_scale={}, atlas_offset={} ({:.1} MB)",
+            w, h, c, if atlas_format == ATLAS_FORMAT_UINT8_RGBA { "uint8_rgba" } else { "fp16_rgb" },
+            n, kernel_type, uv_extent, sb_number,
+            sh_bias, res_bias, compact_mult, atlas_scale, atlas_offset,
+            (rects_size + atlas_size + sb_bytes) as f64 / 1e6
         );
 
         self.atlas_texture = Some(atlas_data);
@@ -310,57 +411,41 @@ impl GenericGaussianPointCloud {
         self.atlas_channels = c;
         self.uv_extent = uv_extent;
         self.kernel_type = kernel_type;
+        self.sh_bias = sh_bias;
+        self.res_bias = res_bias;
+        self.compact_mult = compact_mult;
+        self.atlas_format = atlas_format;
+        self.atlas_scale = atlas_scale;
+        self.atlas_offset = atlas_offset;
+        self.sb_params = sb_params;
+        self.sb_number = sb_number;
         Ok(())
     }
 
-    /// Load atlas textures from raw NATL bytes (for WASM where file paths aren't available).
+    /// Load atlas textures from a binary file. Accepts NATL (v1) and NAT2 (v2).
+    pub fn load_atlas_from_file(&mut self, path: &Path) -> anyhow::Result<()> {
+        let mut file = std::fs::File::open(path)?;
+        let mut magic = [0u8; 4];
+        file.read_exact(&mut magic)?;
+        let is_v2 = match &magic {
+            b"NAT2" => true,
+            b"NATL" => false,
+            _ => return Err(anyhow::anyhow!("Invalid atlas file magic (expected NATL or NAT2)")),
+        };
+        self.load_atlas_body(&mut file, is_v2)
+    }
+
+    /// Load atlas textures from raw bytes (for WASM). Accepts NATL (v1) and NAT2 (v2).
     pub fn load_atlas_from_bytes(&mut self, data: &[u8]) -> anyhow::Result<()> {
-        use std::io::Read as _;
         let mut cursor = std::io::Cursor::new(data);
         let mut magic = [0u8; 4];
         cursor.read_exact(&mut magic)?;
-        if &magic != b"NATL" {
-            return Err(anyhow::anyhow!("Invalid atlas file magic (expected NATL)"));
-        }
-        let mut header = [0u8; 28];
-        cursor.read_exact(&mut header)?;
-        let w = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
-        let h = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
-        let c = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
-        let kernel_type = u32::from_le_bytes([header[12], header[13], header[14], header[15]]);
-        let n = u32::from_le_bytes([header[16], header[17], header[18], header[19]]) as usize;
-        let uv_extent = f32::from_le_bytes([header[20], header[21], header[22], header[23]]);
-
-        if n != self.num_points {
-            return Err(anyhow::anyhow!(
-                "Atlas has {} rects but PLY has {} points",
-                n, self.num_points
-            ));
-        }
-
-        let rects_size = n * 4 * 4;
-        let mut rects_bytes = vec![0u8; rects_size];
-        cursor.read_exact(&mut rects_bytes)?;
-        let rects: Vec<f32> = bytemuck::cast_slice(&rects_bytes).to_vec();
-
-        let atlas_size = h as usize * w as usize * c as usize * 2;
-        let mut atlas_data = vec![0u8; atlas_size];
-        cursor.read_exact(&mut atlas_data)?;
-
-        log::info!(
-            "loaded atlas from bytes {}x{}x{}, {} rects, kernel_type={}, uv_extent={} ({:.1} MB)",
-            w, h, c, n, kernel_type, uv_extent,
-            (rects_size + atlas_size) as f64 / 1e6
-        );
-
-        self.atlas_texture = Some(atlas_data);
-        self.atlas_rects = Some(rects);
-        self.atlas_width = w;
-        self.atlas_height = h;
-        self.atlas_channels = c;
-        self.uv_extent = uv_extent;
-        self.kernel_type = kernel_type;
-        Ok(())
+        let is_v2 = match &magic {
+            b"NAT2" => true,
+            b"NATL" => false,
+            _ => return Err(anyhow::anyhow!("Invalid atlas file magic (expected NATL or NAT2)")),
+        };
+        self.load_atlas_body(&mut cursor, is_v2)
     }
 }
 

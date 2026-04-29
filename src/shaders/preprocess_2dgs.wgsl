@@ -89,7 +89,15 @@ struct RenderSettings {
     kernel_size: f32,
     walltime: f32,
     scene_extend: f32,
-    center: vec3<f32>,
+    // Bake scalars live here in the shared SplattingArgsUniform — unused by this
+    // shader but the struct layout must match so scene_center lands at offset 80.
+    sh_bias: f32,
+    compact_mult: f32,
+    sb_number: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+    center: vec4<f32>,
 }
 
 @group(0) @binding(0)
@@ -126,8 +134,10 @@ fn sh_coef(splat_idx: u32, c_idx: u32) -> vec3<f32> {
     return vec3<f32>(a, b, c);
 }
 
-// spherical harmonics evaluation with Condon-Shortley phase
-fn evaluate_sh(dir: vec3<f32>, v_idx: u32, sh_deg: u32) -> vec3<f32> {
+// spherical harmonics evaluation with Condon-Shortley phase.
+// Adds the training-time SH bias (CUDA d_sh_bias) at the end. The caller
+// clamps to >= 0 so this matches computeColorFromSH's `max(SH + bias, 0)`.
+fn evaluate_sh(dir: vec3<f32>, v_idx: u32, sh_deg: u32, sh_bias: f32) -> vec3<f32> {
     var result = SH_C0 * sh_coef(v_idx, 0u);
 
     if sh_deg > 0u {
@@ -152,7 +162,7 @@ fn evaluate_sh(dir: vec3<f32>, v_idx: u32, sh_deg: u32) -> vec3<f32> {
             }
         }
     }
-    result += 0.5;
+    result += sh_bias;
     return result;
 }
 
@@ -281,11 +291,16 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
         B = A_inv * mat2x2<f32>(v1, v2);
     }
 
-    // SH color
+    // SH color — clamp(SH + sh_bias, 0). Mirrors CUDA computeColorFromSH.
+    // NOTE: SB (spherical-beta) lobes are NOT yet evaluated in this hardware
+    // render path. The compute tile-raster path (preprocess_tile_2dgs.wgsl)
+    // does fold in SB. Scenes trained with --feature beta will be missing the
+    // view-dependent SB contribution when rendered via the vertex/fragment
+    // pipeline. TODO: thread sb_params through a separate bind group.
     let camera_pos = camera.view_inv[3].xyz;
     let dir = normalize(xyz - camera_pos);
     let color = vec4<f32>(
-        max(vec3<f32>(0.0), evaluate_sh(dir, idx, render_settings.max_sh_deg)),
+        max(vec3<f32>(0.0), evaluate_sh(dir, idx, render_settings.max_sh_deg, render_settings.sh_bias)),
         opacity
     );
 

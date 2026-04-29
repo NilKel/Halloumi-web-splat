@@ -79,7 +79,14 @@ struct RenderSettings {
     kernel_size: f32,
     walltime: f32,
     scene_extend: f32,
-    center: vec3<f32>,
+    sh_bias: f32,       // additive SH bias before ReLU (CUDA d_sh_bias)
+    compact_mult: f32,  // FastGS Compact Box multiplier on AdR r_lp (CUDA d_compact_mult)
+    sb_number: u32,     // number of SB lobes per Gaussian (0 = SB disabled)
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+    // scene_center lands at offset 80 (16-byte aligned) — vec4 alignment requirement.
+    center: vec4<f32>,
 }
 
 struct DrawIndirect {
@@ -131,6 +138,12 @@ var<storage, read_write> rect_data: array<vec4<u32>>;
 var<storage, read_write> depth_16: array<u32>;
 @group(3) @binding(4)
 var<uniform> tile_info: TileInfo;
+// Spherical-Beta lobes: flat array of f32, laid out as [N, sb_number, 6]
+// (per lobe: r, g, b, theta, phi, beta_raw). Bound as a storage buffer; even
+// when sb_number == 0, a dummy 16-byte buffer is provided so the binding
+// is always valid.
+@group(3) @binding(5)
+var<storage, read> sb_params: array<f32>;
 
 fn sh_coef(splat_idx: u32, c_idx: u32) -> vec3<f32> {
     let a = unpack2x16float(sh_coefs[splat_idx][(c_idx * 3u + 0u) / 2u])[(c_idx * 3u + 0u) % 2u];
@@ -139,7 +152,7 @@ fn sh_coef(splat_idx: u32, c_idx: u32) -> vec3<f32> {
     return vec3<f32>(a, b, c);
 }
 
-fn evaluate_sh(dir: vec3<f32>, v_idx: u32, sh_deg: u32) -> vec3<f32> {
+fn evaluate_sh(dir: vec3<f32>, v_idx: u32, sh_deg: u32, sh_bias: f32) -> vec3<f32> {
     var result = SH_C0 * sh_coef(v_idx, 0u);
     if sh_deg > 0u {
         let x = dir.x; let y = dir.y; let z = dir.z;
@@ -153,8 +166,49 @@ fn evaluate_sh(dir: vec3<f32>, v_idx: u32, sh_deg: u32) -> vec3<f32> {
             }
         }
     }
-    result += 0.5;
+    // NOTE: the final clamp(>=0) is applied by the caller, matching
+    // computeColorFromSH in CUDA (result + d_sh_bias, then max(0)).
+    result += sh_bias;
     return result;
+}
+
+// Spherical-Beta (SB) view-dependent lobes. Per lobe: (r, g, b, theta, phi,
+// beta_raw). Matches CUDA eval_sb in diff_surfel_bake_render/forward.cu.
+// Returns a non-negative RGB lobe sum (softplus-activated colors, gated on
+// dot(mu, view) > 0, so output is always >= 0 and only adds to SH color).
+fn eval_sb(gauss_id: u32, view_dir: vec3<f32>) -> vec3<f32> {
+    let K = render_settings.sb_number;
+    if K == 0u {
+        return vec3<f32>(0.0);
+    }
+    let softplus_scale: f32 = 10.0 * 0.693147180559945;  // 10 * ln(2)
+    var rgb_sum = vec3<f32>(0.0);
+    let base = gauss_id * K * 6u;
+    for (var k = 0u; k < K; k = k + 1u) {
+        let o = base + k * 6u;
+        let r        = sb_params[o + 0u];
+        let g        = sb_params[o + 1u];
+        let b        = sb_params[o + 2u];
+        let theta    = sb_params[o + 3u];
+        let phi      = sb_params[o + 4u];
+        let beta_raw = sb_params[o + 5u];
+        let beta = 4.0 * exp(beta_raw);
+        // Softplus activation on RGB (steep, matches CUDA).
+        let sr = log(1.0 + exp(softplus_scale * r)) / softplus_scale;
+        let sg = log(1.0 + exp(softplus_scale * g)) / softplus_scale;
+        let sb_ = log(1.0 + exp(softplus_scale * b)) / softplus_scale;
+        let st = sin(theta);
+        let ct = cos(theta);
+        let sp = sin(phi);
+        let cp = cos(phi);
+        let mu = vec3<f32>(st * cp, st * sp, ct);
+        let d = dot(mu, view_dir);
+        if d > 0.0 {
+            let w = pow(d, beta);
+            rgb_sum = rgb_sum + vec3<f32>(sr * w, sg * w, sb_ * w);
+        }
+    }
+    return rgb_sum;
 }
 
 // Build 3x3 rotation matrix from quaternion (w, x, y, z)
@@ -301,12 +355,18 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    let use_adr = (AABB_MODE == 3u);
+    // AABB_MODE: 0 = square + fixed cutoff, 1 = square + AdR, 2 = rect + fixed, 3 = rect + AdR.
+    // Mirrors the CUDA compact-box logic: r_lp gets multiplied by d_compact_mult.
+    let use_adr = (AABB_MODE == 1u || AABB_MODE == 3u);
+    let compact_mult = render_settings.compact_mult;
 
     if use_adr {
-        // AdR: compute opacity-adaptive cutoff
         if KERNEL_TYPE == 4u {
-            // BetaScaled kernel: k²=9, k=3
+            // BetaScaled kernel (k²=9, k=3): r_beta from kernel threshold, r_lp from low-pass.
+            // NOTE: training's beta-AdR path (diff_surfel_3D_sh_res forward.cu ~L663)
+            // leaves r_lp unmodified — compact_mult is only applied to the pure-Gaussian
+            // AdR branch. Applying it here instead would make beta kernels render dimmer
+            // than training.
             let k = 3.0;
             let ratio = 1.0 / (255.0 * opacity);
             var r_beta = 0.0;
@@ -320,24 +380,40 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>) {
                 r_lp = sqrt(2.0 * log_term);
             }
             cutoff = max(r_beta, r_lp);
-            cutoff = min(cutoff, k + 2.0); // safety clamp to 5.0
-        } else {
-            // Gaussian kernel: solve opacity * exp(-r²/2) = 1/255
+            cutoff = min(cutoff, k + 2.0);
+        } else if KERNEL_TYPE == 1u {
+            // Beta kernel (k²=1, k=1): same structure as BetaScaled, tighter k.
+            // Same rule — no compact_mult on r_lp.
+            let k = 1.0;
+            let ratio = 1.0 / (255.0 * opacity);
+            var r_beta = 0.0;
+            let threshold = pow(ratio, 1.0 / shape);
+            if threshold < 1.0 {
+                r_beta = k * sqrt(1.0 - threshold);
+            }
+            var r_lp = 0.0;
             let log_term = log(255.0 * opacity);
             if log_term > 0.0 {
-                cutoff = sqrt(2.0 * log_term);
-            } else {
-                return;
+                r_lp = sqrt(2.0 * log_term);
             }
-            cutoff = min(cutoff, 3.5);
+            cutoff = max(r_beta, r_lp);
+            cutoff = min(cutoff, k + 2.0);
+        } else {
+            // Gaussian: solve opacity * exp(-r²/2) = 1/255.
+            let log_term = log(255.0 * opacity);
+            if log_term > 0.0 {
+                cutoff = sqrt(2.0 * log_term * compact_mult);
+            } else {
+                cutoff = 0.1;
+            }
+            cutoff = min(cutoff, 4.0);
         }
     } else {
-        // Fixed cutoff
-        if KERNEL_TYPE == 4u {
-            cutoff = 5.0; // k + 2 for BetaScaled (k=3)
-        } else {
-            cutoff = 3.5; // ~4σ for Gaussian
-        }
+        // Mode 0 (square) / mode 2 (rect): fixed 4σ (2DGS default) for ANY kernel.
+        // We do NOT have a WGSL equivalent of CUDA mode 4 (use_beta_fixed) —
+        // if you wanted the tight beta-compact path, run under AdR (mode 1/3).
+        // The previous "KERNEL_TYPE==4 → 3.3" fallback caused ~16% dimming vs training.
+        cutoff = 4.0;
     }
 
     // Compute AABB from transmat
@@ -379,10 +455,14 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    // SH color evaluation
+    // SH color evaluation: clamp(SH_eval + sh_bias, 0). Mirrors CUDA computeColorFromSH.
+    // SB view-dep lobes are added in unclamped per the CUDA ordering:
+    //   feat = max(0, SH + sh_bias) + residual + SB + res_bias  (ReLU at the end).
+    // Residual and res_bias are applied in tile_raster; SH + SB fold in here.
     let camera_pos = camera.view_inv[3].xyz;
-    let dir = normalize(xyz - camera_pos);
-    let color = max(vec3<f32>(0.0), evaluate_sh(dir, idx, render_settings.max_sh_deg));
+    let view_dir = normalize(xyz - camera_pos);
+    var color = max(vec3<f32>(0.0), evaluate_sh(view_dir, idx, render_settings.max_sh_deg, render_settings.sh_bias));
+    color = color + eval_sb(idx, view_dir);
 
     // Store to output
     let store_idx = atomicAdd(&sort_infos.keys_size, 1u);

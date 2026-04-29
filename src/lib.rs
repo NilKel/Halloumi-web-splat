@@ -86,11 +86,19 @@ impl WGPUContext {
 
         #[cfg(target_arch = "wasm32")]
         let required_features = wgpu::Features::default();
-        #[cfg(not(target_arch = "wasm32"))]
+        // macOS / Metal does not reliably support `TIMESTAMP_QUERY_INSIDE_ENCODERS`,
+        // and on older macOS even `TIMESTAMP_QUERY` itself is unavailable; requesting
+        // these as required features makes `request_device` panic. Drop timestamp
+        // features on Apple targets — the GPUStopwatch code paths are gated on
+        // `Some(stopwatch)`, which we leave None when timestamps aren't requested.
+        #[cfg(all(not(target_arch = "wasm32"), not(target_os = "macos"), not(target_os = "ios")))]
         let required_features = wgpu::Features::TIMESTAMP_QUERY
             | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
             | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
             | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let required_features = wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
+            | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
 
         let adapter_limits = adapter.limits();
 
@@ -274,7 +282,12 @@ impl WindowContext {
             size.height,
         );
 
-        let stopwatch = if cfg!(not(target_arch = "wasm32")) {
+        // GPU timestamps are unsupported on macOS/iOS Metal (see required_features
+        // above); the stopwatch buffers cannot be created without them. Requested
+        // by the renderer's author: skip rasterization timing on Apple targets.
+        let stopwatch = if cfg!(not(target_arch = "wasm32"))
+            && !cfg!(any(target_os = "macos", target_os = "ios"))
+        {
             Some(GPUStopwatch::new(device, Some(3)))
         } else {
             None
@@ -912,7 +925,10 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
                         }
                         state.needs_prepare = true;
                     }else if key == KeyCode::KeyB && state.compute_raster_enabled {
-                        // Run GPU benchmark for compute raster passes
+                        // Run GPU benchmark for compute raster passes. Disabled
+                        // on macOS/iOS — Metal can't satisfy the TIMESTAMP_QUERY
+                        // feature this routine relies on (see WGPUContext::new).
+                        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
                         if let Some(ref mut tr) = state.tile_raster {
                             log::info!("Running compute raster benchmark...");
                             tr.prepare_benchmark(
@@ -923,6 +939,8 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
                                 state.splatting_args,
                             );
                         }
+                        #[cfg(any(target_os = "macos", target_os = "ios"))]
+                        log::info!("Compute raster benchmark disabled on macOS (no GPU timestamps)");
                     }else if key == KeyCode::KeyA{
                         state.atlas_enabled = !state.atlas_enabled;
                         log::info!("Atlas texture: {}", if state.atlas_enabled { "enabled" } else { "disabled" });

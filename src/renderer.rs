@@ -14,14 +14,22 @@ use wgpu::{Extent3d, MultisampleState, include_wgsl};
 
 use cgmath::{EuclideanSpace, Matrix4, Point3, SquareMatrix, Vector2, Vector4};
 
-/// Uniform buffer for 2DGS texture parameters
+/// Uniform for tile_raster (what every pixel needs per Gaussian). SB is not
+/// here because it's already folded into the per-Gaussian color by preprocess
+/// (view dir is Gaussian-centric, not pixel-centric). Matches CUDA's final
+/// `feat + d_res_bias` activation + the atlas dequant path. 32 bytes = 2 × vec4.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct TexParamsUniform {
     pub atlas_width: u32,
     pub atlas_height: u32,
-    pub kernel_type: u32,  // 0=Gaussian, 1=Beta, 2=Flex, 3=General, 4=BetaScaled
-    pub uv_extent_bits: u32, // f32 reinterpreted as u32 for uniform alignment
+    pub kernel_type: u32,      // 0=Gaussian, 1=Beta, 2=Flex, 3=General, 4=BetaScaled
+    pub uv_extent_bits: u32,   // f32 reinterpreted as u32 for uniform alignment
+
+    pub atlas_format: u32,     // 0=FP16 RGB, 1=UINT8 RGBA (dequant via scale/offset)
+    pub atlas_scale: f32,      // UINT8 dequant: residual = u8_norm * scale + offset
+    pub atlas_offset: f32,
+    pub res_bias: f32,         // final ReLU bias on SH+residual+SB (CUDA d_res_bias)
 }
 
 impl Default for TexParamsUniform {
@@ -31,6 +39,10 @@ impl Default for TexParamsUniform {
             atlas_height: 0,
             kernel_type: 0,
             uv_extent_bits: 4.0f32.to_bits(),
+            atlas_format: 0,
+            atlas_scale: 1.0,
+            atlas_offset: 0.0,
+            res_bias: 0.0,
         }
     }
 }
@@ -230,6 +242,10 @@ impl GaussianRenderer {
                     atlas_height: pc.map_or(0, |p| p.atlas_height()),
                     kernel_type: pc.map_or(0, |p| p.kernel_type()),
                     uv_extent_bits: pc.map_or(4.0f32, |p| p.uv_extent()).to_bits(),
+                    atlas_format: pc.map_or(0, |p| p.atlas_format()),
+                    atlas_scale: pc.map_or(1.0, |p| p.atlas_scale()),
+                    atlas_offset: pc.map_or(0.0, |p| p.atlas_offset()),
+                    res_bias: pc.map_or(0.0, |p| p.res_bias()),
                 },
                 Some("tex params uniform buffer"),
             );
@@ -994,7 +1010,18 @@ pub struct SplattingArgsUniform {
 
     walltime: f32,
     scene_extend: f32,
-    _pad: [u32; 2],
+    // Bake scalars used by preprocess: sh_bias (SH activation additive),
+    // compact_mult (FastGS Compact Box r_lp scaler), sb_number (# SB lobes).
+    // Match CUDA d_sh_bias / d_compact_mult. SB eval happens per-Gaussian in
+    // preprocess (view dir is Gaussian-centric), so tile_raster doesn't need these.
+    // Three u32 pads follow so scene_center lands at offset 80 — WGSL requires
+    // vec4 members to be 16-byte aligned in uniform buffers.
+    sh_bias: f32,
+    compact_mult: f32,
+    sb_number: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 
     scene_center: Vector4<f32>,
 }
@@ -1028,6 +1055,9 @@ impl SplattingArgsUniform {
                 .scene_extend
                 .unwrap_or(pc.bbox().radius())
                 .max(pc.bbox().radius()),
+            sh_bias: pc.sh_bias(),
+            compact_mult: pc.compact_mult(),
+            sb_number: pc.sb_number(),
             ..Default::default()
         }
     }
@@ -1050,7 +1080,12 @@ impl Default for SplattingArgsUniform {
             walltime: 0.,
             scene_center: Vector4::new(0., 0., 0., 0.),
             scene_extend: 1.,
-            _pad: [0; 2],
+            sh_bias: 0.5,
+            compact_mult: 1.0,
+            sb_number: 0,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
         }
     }
 }

@@ -180,16 +180,31 @@ fn quat_to_rotmat(q: vec4<f32>) -> mat3x3<f32> {
 
 // Compute screen-space AABB from transmat. Returns (cx, cy, hx, hy) in pixel
 // coords (CUDA Y-up convention — pix.y=H is top). hx/hy < 0 → degenerate.
+//
+// d = cutoff²·(Tw.x² + Tw.y²) − Tw.z². For a non-degenerate splat (the
+// projected disk has finite extent) we need |Tw.z| > cutoff·|Tw.xy|, i.e.
+// d < 0. CUDA's bake_render checks `d == 0` which never holds in FP — but
+// d ≥ 0 is the *real* degenerate condition (the conic equation 1/d·t·…
+// blows up). When the camera matrices wobble in FP, edge-on splats land
+// on either side of d == 0 frame-to-frame and pop in/out. Cull anything
+// with d ≥ 0.
+//
+// Likewise, h0 = p² − ⟨f·T[0]·T[0]⟩ < 0 means the AABB is imaginary in
+// that axis (also a degenerate orientation — clamping with max(1e-4) gave
+// a 0.02-pixel quad and produced gaps in the splat's footprint). Cull.
 fn compute_aabb(T: mat3x3<f32>, cutoff: f32) -> vec4<f32> {
     let t = vec3<f32>(cutoff * cutoff, cutoff * cutoff, -1.0);
     let d = dot(t, T[2] * T[2]);
-    if d == 0.0 {
+    if d >= 0.0 {
         return vec4<f32>(0.0, 0.0, -1.0, -1.0);
     }
     let f = (1.0 / d) * t;
     let p = vec2<f32>(dot(f, T[0] * T[2]), dot(f, T[1] * T[2]));
     let h0 = p * p - vec2<f32>(dot(f, T[0] * T[0]), dot(f, T[1] * T[1]));
-    let h = sqrt(max(vec2<f32>(1e-4, 1e-4), h0));
+    if any(h0 < vec2<f32>(0.0)) {
+        return vec4<f32>(0.0, 0.0, -1.0, -1.0);
+    }
+    let h = sqrt(h0);
     return vec4<f32>(p.x, p.y, h.x, h.y);
 }
 
@@ -218,10 +233,6 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
     let pos2d = camera.proj * camspace;
     let bounds = 1.2 * pos2d.w;
     let z_ndc = pos2d.z / pos2d.w;
-
-    if idx == 0u {
-        atomicAdd(&sort_dispatch.dispatch_x, 1u);
-    }
 
     if z_ndc <= 0.0 || z_ndc >= 1.0 || pos2d.x < -bounds || pos2d.x > bounds || pos2d.y < -bounds || pos2d.y > bounds {
         return;

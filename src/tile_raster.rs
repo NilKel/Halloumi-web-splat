@@ -82,6 +82,7 @@ pub struct TileRasterPipeline {
     prefix_sum_reduce: wgpu::ComputePipeline,
     prefix_sum_scan_blocks: wgpu::ComputePipeline,
     prefix_sum_propagate: wgpu::ComputePipeline,
+    prefix_sum_reduce_exclusive: wgpu::ComputePipeline,
     duplicate_keys_pipeline: wgpu::ComputePipeline,
     identify_ranges_pipeline: wgpu::ComputePipeline,
     tile_raster_pipeline: wgpu::ComputePipeline,
@@ -104,6 +105,7 @@ pub struct TileRasterPipeline {
     tile_info: UniformBuffer<TileInfoUniform>,
     tile_raster_info: UniformBuffer<TileRasterInfoUniform>,
     prefix_sum_info: UniformBuffer<PrefixSumInfoUniform>,
+    prefix_sum_info_l2: UniformBuffer<PrefixSumInfoUniform>,
     duplicate_info: UniformBuffer<DuplicateInfoUniform>,
     viewport_info: UniformBuffer<ViewportInfoUniform>,
 
@@ -121,6 +123,7 @@ pub struct TileRasterPipeline {
     conic_data_buf: wgpu::Buffer,
     depth_16_buf: wgpu::Buffer,
     prefix_sum_block_sums: wgpu::Buffer,
+    prefix_sum_block_sums_l2: wgpu::Buffer,
     tile_starts_buf: wgpu::Buffer,
     tile_ends_buf: wgpu::Buffer,
     output_buf: wgpu::Buffer,
@@ -136,6 +139,7 @@ pub struct TileRasterPipeline {
 
     // Bind groups
     prefix_sum_bg: wgpu::BindGroup,
+    prefix_sum_bg_l2: wgpu::BindGroup,
     duplicate_keys_bg: wgpu::BindGroup,
     identify_ranges_bg: wgpu::BindGroup,
     tile_raster_bg: wgpu::BindGroup,
@@ -220,6 +224,23 @@ impl TileRasterPipeline {
             Some("prefix sum info uniform"),
         );
 
+        // 2-level prefix sum: L2 operates on L1's block_sums. num_l1_blocks
+        // = ceil(num_points / 256). L2 scan_blocks (single workgroup of 256
+        // threads) handles up to 256 L2 blocks, so num_l1_blocks must be
+        // ≤ 256 * 256 = 65536. With current 256-thread workgroups that gives
+        // a max num_points of 16M (plenty for any single scene).
+        let num_l1_blocks = (num_points + 255) / 256;
+        let prefix_sum_info_l2 = UniformBuffer::new(
+            device,
+            PrefixSumInfoUniform {
+                num_elements: num_l1_blocks,
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
+            },
+            Some("prefix sum info L2 uniform"),
+        );
+
         let duplicate_info = UniformBuffer::new(
             device,
             DuplicateInfoUniform {
@@ -279,6 +300,16 @@ impl TileRasterPipeline {
         let prefix_sum_block_sums = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("prefix_sum_block_sums"),
             size: (num_prefix_blocks.max(1) as u64) * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // L2 block sums for the 2-level scan. Holds totals for super-blocks
+        // of 256 L1 blocks each. Sized for ceil(num_l1_blocks / 256).
+        let num_prefix_blocks_l2 = (num_prefix_blocks + 255) / 256;
+        let prefix_sum_block_sums_l2 = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("prefix_sum_block_sums_l2"),
+            size: (num_prefix_blocks_l2.max(1) as u64) * 4,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -457,6 +488,28 @@ impl TileRasterPipeline {
             ],
         });
 
+        // L2 prefix-sum bind group: scans the L1 block_sums buffer, producing
+        // L2 block totals into block_sums_l2. Same layout as L1 (data, block_sums,
+        // info) but pointing one level up.
+        let prefix_sum_bg_l2 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("prefix sum bg L2"),
+            layout: &prefix_sum_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: prefix_sum_block_sums.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: prefix_sum_block_sums_l2.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: prefix_sum_info_l2.buffer().as_entire_binding(),
+                },
+            ],
+        });
+
         // Duplicate keys: tile_offsets(read) + rect_data(read) + depth_vals(read)
         // + tile_keys(rw) + tile_payloads(rw) + info(uniform) + sort_infos(read)
         // + conic_data(read) for AccuTile per-row pruning.
@@ -562,9 +615,28 @@ impl TileRasterPipeline {
                 storage_rw_entry(4), // output_buf
                 uniform_entry(5),    // tile_raster_info
                 storage_ro_entry(6), // tile_ends
-                storage_ro_entry(7), // atlas_texture
+                storage_ro_entry(7), // atlas_texture (legacy UINT8/FP16 storage path)
                 storage_ro_entry(8), // atlas_rects
                 uniform_entry(9),    // tex_params
+                // BC7 atlas as a texture_2d_array<f32> + sampler. Same binding
+                // shape as the HW path's group(3). atlas_format == 2 dispatches
+                // here; UINT8/FP16 keep using the storage buffer above.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 10,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 11,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         });
 
@@ -741,6 +813,19 @@ impl TileRasterPipeline {
                 compilation_options: Default::default(),
                 cache: None,
             });
+        // L2 reduce: same shader as `reduce` but writes EXCLUSIVE in-block scan
+        // (no `+original` add), so the L2 propagate result becomes exclusive
+        // total prefix in block_sums_l1, which the L1 propagate then adds to
+        // data to give correct inclusive total. See prefix_sum.wgsl comments.
+        let prefix_sum_reduce_exclusive =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("prefix sum reduce_exclusive (L2)"),
+                layout: Some(&prefix_sum_layout),
+                module: &prefix_sum_shader,
+                entry_point: Some("reduce_exclusive"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
 
         // Duplicate keys pipeline
         let duplicate_keys_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -906,6 +991,8 @@ impl TileRasterPipeline {
             None,
             None,
             None,
+            None,
+            None,
         );
 
         Self {
@@ -913,6 +1000,7 @@ impl TileRasterPipeline {
             prefix_sum_reduce,
             prefix_sum_scan_blocks,
             prefix_sum_propagate,
+            prefix_sum_reduce_exclusive,
             duplicate_keys_pipeline,
             identify_ranges_pipeline,
             tile_raster_pipeline,
@@ -930,6 +1018,7 @@ impl TileRasterPipeline {
             tile_info,
             tile_raster_info,
             prefix_sum_info,
+            prefix_sum_info_l2,
             duplicate_info,
             viewport_info,
             camera,
@@ -943,6 +1032,7 @@ impl TileRasterPipeline {
             conic_data_buf,
             depth_16_buf,
             prefix_sum_block_sums,
+            prefix_sum_block_sums_l2,
             tile_starts_buf,
             tile_ends_buf,
             output_buf,
@@ -956,6 +1046,7 @@ impl TileRasterPipeline {
             tile_sort_dis,
 
             prefix_sum_bg,
+            prefix_sum_bg_l2,
             duplicate_keys_bg,
             identify_ranges_bg,
             tile_raster_bg,
@@ -1055,6 +1146,8 @@ impl TileRasterPipeline {
         splat_2d_buf: Option<&wgpu::Buffer>,
         atlas_buf: Option<&wgpu::Buffer>,
         atlas_rects_buf: Option<&wgpu::Buffer>,
+        atlas_bc7_view: Option<&wgpu::TextureView>,
+        atlas_bc7_sampler: Option<&wgpu::Sampler>,
     ) -> wgpu::BindGroup {
         // Create dummy buffers for missing optional bindings.
         let dummy_splat;
@@ -1094,6 +1187,38 @@ impl TileRasterPipeline {
                 mapped_at_creation: false,
             });
             dummy_rects.as_entire_binding()
+        };
+
+        // BC7 atlas: real view+sampler when available, else create a 1x1x1
+        // dummy texture + default sampler so the binding is valid (the shader
+        // only samples it when atlas_format == 2). Same shape as HW path.
+        let dummy_tex;
+        let dummy_view;
+        let bc7_view = if let Some(v) = atlas_bc7_view {
+            v
+        } else {
+            dummy_tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("dummy bc7 atlas"),
+                size: wgpu::Extent3d { width: 4, height: 4, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            dummy_view = dummy_tex.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2Array),
+                ..Default::default()
+            });
+            &dummy_view
+        };
+        let dummy_samp;
+        let bc7_samp = if let Some(s) = atlas_bc7_sampler {
+            s
+        } else {
+            dummy_samp = device.create_sampler(&wgpu::SamplerDescriptor::default());
+            &dummy_samp
         };
 
         device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1140,6 +1265,14 @@ impl TileRasterPipeline {
                     binding: 9,
                     resource: tex_params.buffer().as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: wgpu::BindingResource::TextureView(bc7_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: wgpu::BindingResource::Sampler(bc7_samp),
+                },
             ],
         })
     }
@@ -1171,6 +1304,8 @@ impl TileRasterPipeline {
             Some(pc.splat_2d_buffer()),
             pc.atlas_buffer(),
             pc.atlas_rects_buffer(),
+            pc.atlas_bc7_view(),
+            pc.atlas_bc7_sampler(),
         );
 
         // Preprocess bg3 needs the SB params buffer; rebuild it whenever the
@@ -1657,45 +1792,83 @@ impl TileRasterPipeline {
         debug_sync!("preprocess", encoder, debug_device, queue);
 
         // ========== Pass 2: Prefix sum on tiles_touched ==========
-        // Note: num_elements for prefix sum = num_visible (from preprocess).
-        // For simplicity, we run prefix sum on the full num_points buffer.
-        // Elements beyond num_visible will be 0, so this is safe.
+        // Two-level prefix sum:
+        //   L1 reduce — per-256 inclusive in-block scan, writes block_sums_l1
+        //   L2 reduce_exclusive — per-256 EXCLUSIVE in-block scan over
+        //       block_sums_l1, writes block_sums_l2
+        //   L2 scan_blocks — single-WG exclusive prefix scan of block_sums_l2
+        //   L2 propagate — adds block_sums_l2[k] to each block_sums_l1 in
+        //       super-block k → block_sums_l1 = exclusive total prefix
+        //   L1 propagate — adds block_sums_l1[i] to each data in block i
+        //
+        // The L2 reduce uses `reduce_exclusive` (no `+original` add), so
+        // block_sums_l1 ends up exclusive within its L2 super-block. After L2
+        // propagate adds the exclusive L2 prefix, block_sums_l1 = exclusive
+        // total prefix at block i, which is exactly what L1 propagate wants.
+        // This handles num_points up to ~16M (256 blocks × 256 sub-blocks ×
+        // 256 elements). Old code only handled 65k elements before this fix.
         {
-            let wgs = (num_points as f32 / 256.0).ceil() as u32;
+            let wgs_l1 = (num_points as f32 / 256.0).ceil() as u32;
+            let num_l1_blocks = (num_points + 255) / 256;
+            let wgs_l2 = (num_l1_blocks as f32 / 256.0).ceil() as u32;
 
-            // Reduce pass
+            // L1 reduce
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("prefix sum reduce"),
+                    label: Some("prefix sum L1 reduce"),
                     ..Default::default()
                 });
                 pass.set_pipeline(&self.prefix_sum_reduce);
                 pass.set_bind_group(0, &self.prefix_sum_bg, &[]);
-                pass.dispatch_workgroups(wgs, 1, 1);
+                pass.dispatch_workgroups(wgs_l1, 1, 1);
             }
             debug_sync!("prefix_sum_reduce", encoder, debug_device, queue);
 
-            // Scan blocks pass (single workgroup)
+            // L2 reduce_exclusive (operates on block_sums_l1, writes block_sums_l2)
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("prefix sum scan blocks"),
+                    label: Some("prefix sum L2 reduce_exclusive"),
+                    ..Default::default()
+                });
+                pass.set_pipeline(&self.prefix_sum_reduce_exclusive);
+                pass.set_bind_group(0, &self.prefix_sum_bg_l2, &[]);
+                pass.dispatch_workgroups(wgs_l2, 1, 1);
+            }
+            debug_sync!("prefix_sum_l2_reduce", encoder, debug_device, queue);
+
+            // L2 scan_blocks (single WG; ≤256 super-blocks → fits)
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("prefix sum L2 scan_blocks"),
                     ..Default::default()
                 });
                 pass.set_pipeline(&self.prefix_sum_scan_blocks);
-                pass.set_bind_group(0, &self.prefix_sum_bg, &[]);
+                pass.set_bind_group(0, &self.prefix_sum_bg_l2, &[]);
                 pass.dispatch_workgroups(1, 1, 1);
             }
-            debug_sync!("prefix_sum_scan_blocks", encoder, debug_device, queue);
+            debug_sync!("prefix_sum_l2_scan_blocks", encoder, debug_device, queue);
 
-            // Propagate pass
+            // L2 propagate (block_sums_l1 ← in-L2-block exclusive + L2 exclusive)
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("prefix sum propagate"),
+                    label: Some("prefix sum L2 propagate"),
+                    ..Default::default()
+                });
+                pass.set_pipeline(&self.prefix_sum_propagate);
+                pass.set_bind_group(0, &self.prefix_sum_bg_l2, &[]);
+                pass.dispatch_workgroups(wgs_l2, 1, 1);
+            }
+            debug_sync!("prefix_sum_l2_propagate", encoder, debug_device, queue);
+
+            // L1 propagate (data ← in-block inclusive + exclusive total at block)
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("prefix sum L1 propagate"),
                     ..Default::default()
                 });
                 pass.set_pipeline(&self.prefix_sum_propagate);
                 pass.set_bind_group(0, &self.prefix_sum_bg, &[]);
-                pass.dispatch_workgroups(wgs, 1, 1);
+                pass.dispatch_workgroups(wgs_l1, 1, 1);
             }
             debug_sync!("prefix_sum_propagate", encoder, debug_device, queue);
         }

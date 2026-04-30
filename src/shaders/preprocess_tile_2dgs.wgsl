@@ -242,28 +242,34 @@ fn quat_to_rotmat(q: vec4<f32>) -> mat3x3<f32> {
     );
 }
 
-// Compute AABB from transmat (matches CUDA compute_aabb)
+// Compute AABB from transmat (matches CUDA compute_aabb).
+//
+// d = cutoff²·(Tw.x² + Tw.y²) − Tw.z². For a non-degenerate splat we need
+// |Tw.z| > cutoff·|Tw.xy|, i.e. d < 0. CUDA's bake_render checks d == 0
+// which never holds in FP — but d ≥ 0 is the *real* degenerate condition
+// (the 1/d in the conic equation blows up). When d > 0, near-edge-on
+// splats produce huge fake AABBs that touch thousands of tiles each
+// (verified: total_tile_entries = 180M vs allocated 14M = OOB writes →
+// black image with one stray tile).
+//
+// Same fix as the HW path's compute_aabb in preprocess_2dgs.wgsl. Plus
+// the h0 < 0 explicit cull (when the projected ellipse is imaginary on
+// some axis — degenerate orientation), instead of clamping with
+// `max(1e-4)` which silently produced 0.02-pixel quads with gaps.
 fn compute_aabb(T: mat3x3<f32>, cutoff: f32) -> vec4<f32> {
-    // T[0] = Tu, T[1] = Tv, T[2] = Tw (columns)
     let t = vec3<f32>(cutoff * cutoff, cutoff * cutoff, -1.0);
     let d = dot(t, T[2] * T[2]);
-    if d == 0.0 {
-        return vec4<f32>(0.0, 0.0, -1.0, -1.0); // invalid
+    if d >= 0.0 {
+        return vec4<f32>(0.0, 0.0, -1.0, -1.0);
     }
     let f = (1.0 / d) * t;
-
-    let p = vec2<f32>(
-        dot(f, T[0] * T[2]),
-        dot(f, T[1] * T[2])
-    );
-
-    let h0 = p * p - vec2<f32>(
-        dot(f, T[0] * T[0]),
-        dot(f, T[1] * T[1])
-    );
-
-    let h = sqrt(max(vec2<f32>(1e-4, 1e-4), h0));
-    return vec4<f32>(p.x, p.y, h.x, h.y); // center_x, center_y, extent_x, extent_y
+    let p = vec2<f32>(dot(f, T[0] * T[2]), dot(f, T[1] * T[2]));
+    let h0 = p * p - vec2<f32>(dot(f, T[0] * T[0]), dot(f, T[1] * T[1]));
+    if any(h0 < vec2<f32>(0.0)) {
+        return vec4<f32>(0.0, 0.0, -1.0, -1.0);
+    }
+    let h = sqrt(h0);
+    return vec4<f32>(p.x, p.y, h.x, h.y);
 }
 
 // AccuTile conic form: derive (A, B, E, t, p) of the screen-space ellipse
@@ -390,7 +396,11 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>) {
     proj_raw[1].y = -proj_raw[1].y;
     proj_raw[2].y = -proj_raw[2].y;
     proj_raw[3].y = -proj_raw[3].y;
-    let M = proj_raw * camera.view;  // world2ndc = (VP)^T
+    // world2ndc = transpose(P*V) — matches HW path preprocess_2dgs.wgsl :L341
+    // and CUDA's GLM column-major reindexing of the PyTorch-stored projmatrix.
+    // Missing this transpose was the bug that produced 167M tile entries
+    // (every splat's projected ellipse came out warped, producing huge AABBs).
+    let M = transpose(proj_raw * camera.view);
 
     // Compute intermediate: I = transpose(s2w) * M  (3 rows × 4 cols, stored as 3 vec4 rows)
     // I[i][j] = dot(s2w_row_i, M_col_j). M[j] = column j of (PV)^T = row j of PV.
@@ -415,51 +425,16 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>) {
     // AABB_MODE 0: Square AABB + fixed cutoff
     // AABB_MODE 2: Rectangular AABB + fixed cutoff
     // AABB_MODE 3: Rectangular AABB + AdR (opacity-adaptive) cutoff
-    var cutoff: f32;
     if opacity < (1.0 / 255.0) {
         return;
     }
-
-    // AABB_MODE: 0 = square + fixed cutoff, 1 = square + AdR, 2 = rect + fixed, 3 = rect + AdR.
-    let use_adr = (AABB_MODE == 1u || AABB_MODE == 3u);
-    let compact_mult = render_settings.compact_mult;
-
-    let tight = render_settings.tight_beta_bbox == 1u;
-    if (KERNEL_TYPE == 4u || KERNEL_TYPE == 1u) && tight {
-        // Beta-compact path: cutoff = k. The kernel is exactly zero outside
-        // ρ3d ≤ k², so no AdR pad is needed; the rho2d Gaussian floor's
-        // contribution at the disk edge is small enough to ignore.
-        if KERNEL_TYPE == 4u { cutoff = 3.0; } else { cutoff = 1.0; }
-    } else if KERNEL_TYPE == 4u || KERNEL_TYPE == 1u {
-        // Beta-AdR fallback (matches CUDA aabb_mode=3): max(r_beta, r_lp),
-        // capped at k+2. Toggleable via tight_beta_bbox so we can A/B
-        // compare against the tight-cutoff path above.
-        var k: f32; if KERNEL_TYPE == 4u { k = 3.0; } else { k = 1.0; }
-        let ratio = 1.0 / (255.0 * opacity);
-        var r_beta = 0.0;
-        let threshold = pow(ratio, 1.0 / shape);
-        if threshold < 1.0 {
-            r_beta = k * sqrt(1.0 - threshold);
-        }
-        var r_lp = 0.0;
-        let log_term = log(255.0 * opacity);
-        if log_term > 0.0 {
-            r_lp = sqrt(2.0 * log_term);
-        }
-        cutoff = min(max(r_beta, r_lp), k + 2.0);
-    } else if use_adr {
-        // Pure-Gaussian, no compact support — keep AdR formula.
-        let log_term = log(255.0 * opacity);
-        if log_term > 0.0 {
-            cutoff = sqrt(2.0 * log_term * compact_mult);
-        } else {
-            cutoff = 0.1;
-        }
-        cutoff = min(cutoff, 4.0);
-    } else {
-        // Mode 0/2 + Gaussian: fixed 4σ (2DGS default).
-        cutoff = 4.0;
-    }
+    // Fixed 4σ cutoff for ALL kernels — matches CUDA aabb_mode=2 (rect, no
+    // AdR) which is the simplest, most-correct path. Beta kernels still
+    // discard fragments past their compact support in tile_raster's per-
+    // pixel inner loop (rho3d >= k_sq + ε → return). Tighter cutoffs are a
+    // perf optimization not a correctness one — disabled until we get the
+    // raw path matching.
+    let cutoff: f32 = 4.0;
 
     // Compute AABB from transmat
     let aabb = compute_aabb(T_mat, cutoff);
@@ -512,10 +487,16 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Store to output
     let store_idx = atomicAdd(&sort_infos.keys_size, 1u);
 
+    // Store COLUMNS of T_mat (matches HW path preprocess_2dgs.wgsl and the
+    // CUDA transMats[idx*9 + i*3 + k] = T[i].k convention, where T[i] is
+    // column i of glm::mat3). The downstream tile_raster_2dgs / gaussian_2dgs
+    // shaders read Tu = vec3(tu_x, tu_y, tu_z), expecting Tu = T_mat column 0.
+    // Old code stored ROWS by mistake (T_mat[i].x, T_mat[j].x, T_mat[k].x),
+    // producing transposed Tu/Tv/Tw → wrong ray-disk intersection.
     splats_2d[store_idx] = Splat2DGS(
-        T_mat[0].x, T_mat[1].x, T_mat[2].x,
-        T_mat[0].y, T_mat[1].y, T_mat[2].y,
-        T_mat[0].z, T_mat[1].z, T_mat[2].z,
+        T_mat[0].x, T_mat[0].y, T_mat[0].z,  // Tu = column 0
+        T_mat[1].x, T_mat[1].y, T_mat[1].z,  // Tv = column 1
+        T_mat[2].x, T_mat[2].y, T_mat[2].z,  // Tw = column 2
         opacity,
         pack2x16float(center_pix),             // pixel-space center
         0u,

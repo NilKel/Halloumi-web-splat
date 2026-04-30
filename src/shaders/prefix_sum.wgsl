@@ -82,6 +82,60 @@ fn reduce(
     }
 }
 
+// Like `reduce` but writes the EXCLUSIVE in-block scan to data (no `+original`).
+// Used for the second level of a 2-level scan: after L1 reduce produces
+// block_sums_l1, this runs on block_sums_l1 (treated as `data`) to produce
+// block_sums_l2. The exclusive convention here is what makes the rest of the
+// chain (L2 scan_blocks → L2 propagate → L1 propagate) yield correct totals.
+@compute @workgroup_size(256, 1, 1)
+fn reduce_exclusive(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+) {
+    let global_idx = wid.x * WG_SIZE + lid.x;
+
+    if global_idx < info.num_elements {
+        shared_data[lid.x] = data[global_idx];
+    } else {
+        shared_data[lid.x] = 0u;
+    }
+    workgroupBarrier();
+
+    var offset = 1u;
+    for (var d = WG_SIZE >> 1u; d > 0u; d >>= 1u) {
+        if lid.x < d {
+            let ai = offset * (2u * lid.x + 1u) - 1u;
+            let bi = offset * (2u * lid.x + 2u) - 1u;
+            shared_data[bi] += shared_data[ai];
+        }
+        offset <<= 1u;
+        workgroupBarrier();
+    }
+
+    if lid.x == 0u {
+        block_sums[wid.x] = shared_data[WG_SIZE - 1u];
+        shared_data[WG_SIZE - 1u] = 0u;
+    }
+    workgroupBarrier();
+
+    for (var d = 1u; d < WG_SIZE; d <<= 1u) {
+        offset >>= 1u;
+        if lid.x < d {
+            let ai = offset * (2u * lid.x + 1u) - 1u;
+            let bi = offset * (2u * lid.x + 2u) - 1u;
+            let tmp = shared_data[ai];
+            shared_data[ai] = shared_data[bi];
+            shared_data[bi] += tmp;
+        }
+        workgroupBarrier();
+    }
+
+    // Exclusive in-block prefix (no `+original`).
+    if global_idx < info.num_elements {
+        data[global_idx] = shared_data[lid.x];
+    }
+}
+
 // Pass 2: Scan block sums (run on a single workgroup)
 @compute @workgroup_size(256, 1, 1)
 fn scan_blocks(

@@ -103,9 +103,19 @@ struct TexParams {
 
 const ATLAS_FORMAT_FP16_RGB: u32 = 0u;
 const ATLAS_FORMAT_UINT8_RGBA: u32 = 1u;
+const ATLAS_FORMAT_BC7: u32 = 2u;
 
 @group(0) @binding(9)
 var<uniform> tex_params: TexParams;
+
+// BC7 atlas as a sampled texture_2d_array. atlas_format == 2 routes through
+// these via textureSampleLevel (HW BC7 decoder). Other formats use the
+// storage-buffer atlas_texture above. Same binding shape as HW path's
+// gaussian_2dgs.wgsl @group(3) @binding(0) / @binding(2).
+@group(0) @binding(10)
+var atlas_bc7: texture_2d_array<f32>;
+@group(0) @binding(11)
+var atlas_samp: sampler;
 
 // Shared memory — only allocated when USE_SHARED_MEM == 1
 // When USE_SHARED_MEM == 0, this is still declared but never written/read,
@@ -131,10 +141,37 @@ fn read_atlas_uint8(row: i32, col: i32, atlas_w: i32) -> vec3<f32> {
     return vec3<f32>(norm.x * s + o, norm.y * s + o, norm.z * s + o);
 }
 
-// Sample atlas with bilinear interpolation at surfel UV. Branches on
-// atlas_format — both paths use the same UV→pixel mapping as CUDA.
+// Sample atlas with bilinear interpolation at surfel UV.
+//
+// BC7 path (atlas_format == 2): use HW textureSampleLevel on the
+// texture_2d_array. atlas_rects layout is 5-stride (u0, v0_local, w_span,
+// h_span, layer) — matches HW gaussian_2dgs.wgsl exactly.
+//
+// Legacy UINT8/FP16 paths: hand-rolled bilinear from the storage buffer
+// atlas_texture, 4-stride atlas_rects (u0_px, v0_px, u_span, v_span).
 fn sample_atlas(surfel_uv: vec2<f32>, gauss_id: u32) -> vec3<f32> {
     let E = bitcast<f32>(tex_params.uv_extent_bits);
+
+    if tex_params.atlas_format == ATLAS_FORMAT_BC7 {
+        // BC7 layout matches HW path's gaussian_2dgs.wgsl. atlas_rects
+        // stride is 5 floats: u0, v0_local, w_span, h_span, layer.
+        let r_base = gauss_id * 5u;
+        let u0       = atlas_rects[r_base + 0u];
+        let v0_local = atlas_rects[r_base + 1u];
+        let w_span   = atlas_rects[r_base + 2u];
+        let h_span   = atlas_rects[r_base + 3u];
+        let layer    = i32(atlas_rects[r_base + 4u]);
+
+        let au = u0       + (surfel_uv.x + E) / (2.0 * E) * w_span;
+        let av = v0_local + (surfel_uv.y + E) / (2.0 * E) * h_span;
+        let uv = vec2<f32>(
+            (au + 0.5) / f32(tex_params.atlas_width),
+            (av + 0.5) / f32(tex_params.atlas_layer_h),
+        );
+        let rgba = textureSampleLevel(atlas_bc7, atlas_samp, uv, layer, 0.0);
+        return rgba.rgb * tex_params.atlas_scale + vec3<f32>(tex_params.atlas_offset);
+    }
+
     let r_base = gauss_id * 4u;
     let u0_px  = atlas_rects[r_base + 0u];
     let v0_px  = atlas_rects[r_base + 1u];

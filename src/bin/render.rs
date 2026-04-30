@@ -8,7 +8,7 @@ use std::{fs::File, path::PathBuf, time::Duration};
 #[allow(unused_imports)]
 use web_splats::{
     GaussianRenderer, PerspectiveCamera, PointCloud, Scene, SceneCamera, SplattingArgs, Split,
-    WGPUContext, io::GenericGaussianPointCloud,
+    WGPUContext, io::GenericGaussianPointCloud, tile_raster::TileRasterPipeline,
 };
 
 #[derive(Debug, Parser)]
@@ -31,6 +31,20 @@ struct Opt {
     /// Atlas texture file (.natl) for 2DGS rendering
     #[arg(long)]
     atlas: Option<PathBuf>,
+
+    /// Use the compute (tile_raster) path instead of HW raster. Same
+    /// algorithm CUDA bake_render uses (per-tile per-pixel loop with
+    /// CUDA-style early-out at T < ε).
+    #[arg(long, default_value_t = false)]
+    compute_raster: bool,
+
+    /// Tile size for the compute path (8/16/32). Ignored under HW raster.
+    #[arg(long, default_value_t = 16)]
+    tile_size: u32,
+
+    /// AABB mode for the compute path: 0=Square, 2=Rect, 3=Rect+AdR.
+    #[arg(long, default_value_t = 3)]
+    aabb_mode: u32,
 }
 
 #[allow(unused)]
@@ -42,6 +56,7 @@ async fn render_views(
     cameras: Vec<SceneCamera>,
     img_out: &PathBuf,
     split: &str,
+    compute_raster: Option<&mut TileRasterPipeline>,
 ) {
     let img_out = img_out.join(&split);
     println!("saving images to '{}'", img_out.to_string_lossy());
@@ -56,6 +71,7 @@ async fn render_views(
     pb.set_style(pb_style);
     pb.set_message(format!("rendering {split}"));
 
+    let mut compute_raster = compute_raster;
     for (i, s) in cameras.iter().enumerate().progress_with(pb) {
         let mut resolution: Vector2<u32> = Vector2::new(s.width, s.height);
 
@@ -82,40 +98,42 @@ async fn render_views(
 
         let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("render encoder"),
-        });
-
         let mut camera: PerspectiveCamera = s.clone().into();
         if !pc.is_2dgs() {
             camera.fit_near_far(pc.bbox());
         }
-        renderer.prepare(
-            &mut encoder,
-            device,
-            queue,
-            &pc,
-            SplattingArgs {
-                camera: camera,
-                viewport: resolution,
-                gaussian_scaling: 1.,
-                max_sh_deg: pc.sh_deg(),
-                mip_splatting: None,
-                kernel_size: None,
-                clipping_box: None,
-                walltime: Duration::from_secs(100),
-                scene_center: None,
-                scene_extend: None,
-                background_color: wgpu::Color::BLACK,
-                snugbox_hw: false,
-                tight_beta_bbox: true,
-            },
-            &mut None,
-        );
-        queue.submit(std::iter::once(encoder.finish()));
+        let splatting_args = SplattingArgs {
+            camera,
+            viewport: resolution,
+            gaussian_scaling: 1.,
+            max_sh_deg: pc.sh_deg(),
+            mip_splatting: None,
+            kernel_size: None,
+            clipping_box: None,
+            walltime: Duration::from_secs(100),
+            scene_center: None,
+            scene_extend: None,
+            background_color: wgpu::Color::BLACK,
+            snugbox_hw: false,
+            tight_beta_bbox: true,
+        };
+
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("render encoder"),
+            label: Some("frame encoder"),
         });
+
+        // HW path: GaussianRenderer's preprocess + sort + draw.
+        // Compute path: tile_raster does its OWN preprocess + sort + tile
+        // dispatch + fullscreen copy. They use independent sort buffers, so
+        // calling renderer.prepare() here would just be wasted GPU work.
+        if let Some(ref mut tr) = compute_raster {
+            tr.prepare(&mut encoder, queue, &pc, renderer.sorter(), splatting_args);
+        } else {
+            renderer.prepare(
+                &mut encoder, device, queue, &pc, splatting_args, &mut None,
+            );
+        }
+
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("render pass"),
@@ -141,7 +159,11 @@ async fn render_views(
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            renderer.render(&mut render_pass, &pc);
+            if let Some(ref tr) = compute_raster {
+                tr.render(&mut render_pass);
+            } else {
+                renderer.render(&mut render_pass, &pc);
+            }
         }
         queue.submit(std::iter::once(encoder.finish()));
         let mut img = download_texture(&target, device, queue).await;
@@ -205,7 +227,60 @@ async fn main() {
         .or_else(|| test_cams.first().cloned())
         .expect("scene contains no Test-split cameras");
     println!("rendering test camera id={} img_name={}", chosen.id, chosen.img_name);
-    render_views(device, queue, &mut renderer, &mut pc, vec![chosen], &opt.img_out, "").await;
+
+    // Compute the actual render resolution after the 1600-cap downsample
+    // so we can size the tile_raster pipeline correctly. (The HW path
+    // doesn't need this — its target texture handles any size.)
+    let mut resolution: Vector2<u32> = Vector2::new(chosen.width, chosen.height);
+    if resolution.x > 1600 {
+        let s = resolution.x as f32 / 1600.;
+        resolution.x = 1600;
+        resolution.y = (resolution.y as f32 / s) as u32;
+    }
+
+    let mut compute_raster = if opt.compute_raster {
+        let mut tr = TileRasterPipeline::new(
+            device,
+            queue,
+            renderer.color_format(),
+            pc.sh_deg(),
+            renderer.sorter(),
+            pc.num_points(),
+            resolution.x,
+            resolution.y,
+            pc.is_2dgs(),
+            pc.kernel_type(),
+            true,                // use_shared_mem
+            opt.aabb_mode,
+            opt.tile_size,
+        );
+        tr.update_splat_bind_group(device, &pc);
+        // Atlas binding for textured tile raster. tile_raster_2dgs.wgsl
+        // now supports BC7 via textureSampleLevel on a texture_2d_array,
+        // matching the HW path. UINT8/FP16 still go through the storage
+        // buffer path.
+        if pc.atlas_width() > 0 {
+            tr.set_atlas_enabled(true, pc.atlas_width());
+        }
+        println!(
+            "compute raster ENABLED: {}x{} @ tile_size={} aabb_mode={}",
+            resolution.x, resolution.y, opt.tile_size, opt.aabb_mode
+        );
+        Some(tr)
+    } else {
+        None
+    };
+
+    render_views(
+        device,
+        queue,
+        &mut renderer,
+        &mut pc,
+        vec![chosen],
+        &opt.img_out,
+        "",
+        compute_raster.as_mut(),
+    ).await;
 
     println!("done!");
 }

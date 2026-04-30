@@ -44,7 +44,7 @@ pub mod io;
 mod renderer;
 pub use renderer::{GaussianRenderer, SplattingArgs};
 
-mod tile_raster;
+pub mod tile_raster;
 
 mod scene;
 use crate::utils::GPUStopwatch;

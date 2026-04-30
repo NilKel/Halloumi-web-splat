@@ -111,7 +111,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let E_ = abet.z;
     let t_ = abet.w;
     let disc = B_ * B_ - A_ * E_;
-    let use_accutile = (t_ > 0.0) && (disc < 0.0) && (A_ > 0.0) && (E_ > 0.0);
+    // Temporarily force OFF to verify tile-binning correctness without
+    // ellipse-intersection pruning. Set back to the conjuction once the
+    // raw rect-AABB path renders cleanly.
+    let use_accutile = false;
 
     let ts_f = f32(info.tile_size);
 

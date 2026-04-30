@@ -407,7 +407,7 @@ impl GaussianRenderer {
         &self.camera
     }
 
-    pub(crate) fn sorter(&self) -> &GPURSSorter {
+    pub fn sorter(&self) -> &GPURSSorter {
         &self.sorter
     }
 

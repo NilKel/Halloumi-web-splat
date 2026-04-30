@@ -85,9 +85,10 @@ struct RenderSettings {
     sh_bias: f32,       // additive SH bias before ReLU (CUDA d_sh_bias)
     compact_mult: f32,  // FastGS Compact Box multiplier on AdR r_lp (CUDA d_compact_mult)
     sb_number: u32,     // number of SB lobes per Gaussian (0 = SB disabled)
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
+    _pad0: u32,         // = kernel_type (compute path uses const KERNEL_TYPE)
+    _pad1: u32,         // = snugbox_hw (HW-only)
+    // 1 = tight beta-compact-support cutoff (k = 1 or 3); 0 = legacy AdR.
+    tight_beta_bbox: u32,
     // scene_center lands at offset 80 (16-byte aligned) — vec4 alignment requirement.
     center: vec4<f32>,
 }
@@ -423,15 +424,29 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>) {
     let use_adr = (AABB_MODE == 1u || AABB_MODE == 3u);
     let compact_mult = render_settings.compact_mult;
 
-    if KERNEL_TYPE == 4u {
-        // BetaScaled has compact support at ρ3d ≤ 9 (k=3). The kernel is
-        // exactly zero outside; the rho2d Gaussian floor's contribution at
-        // the disk edge is small enough to ignore for bbox purposes (HW
-        // path verified visually identical with this cutoff). No AdR pad.
-        cutoff = 3.0;
-    } else if KERNEL_TYPE == 1u {
-        // Beta has compact support at ρ3d ≤ 1 (k=1). Same reasoning.
-        cutoff = 1.0;
+    let tight = render_settings.tight_beta_bbox == 1u;
+    if (KERNEL_TYPE == 4u || KERNEL_TYPE == 1u) && tight {
+        // Beta-compact path: cutoff = k. The kernel is exactly zero outside
+        // ρ3d ≤ k², so no AdR pad is needed; the rho2d Gaussian floor's
+        // contribution at the disk edge is small enough to ignore.
+        if KERNEL_TYPE == 4u { cutoff = 3.0; } else { cutoff = 1.0; }
+    } else if KERNEL_TYPE == 4u || KERNEL_TYPE == 1u {
+        // Beta-AdR fallback (matches CUDA aabb_mode=3): max(r_beta, r_lp),
+        // capped at k+2. Toggleable via tight_beta_bbox so we can A/B
+        // compare against the tight-cutoff path above.
+        var k: f32; if KERNEL_TYPE == 4u { k = 3.0; } else { k = 1.0; }
+        let ratio = 1.0 / (255.0 * opacity);
+        var r_beta = 0.0;
+        let threshold = pow(ratio, 1.0 / shape);
+        if threshold < 1.0 {
+            r_beta = k * sqrt(1.0 - threshold);
+        }
+        var r_lp = 0.0;
+        let log_term = log(255.0 * opacity);
+        if log_term > 0.0 {
+            r_lp = sqrt(2.0 * log_term);
+        }
+        cutoff = min(max(r_beta, r_lp), k + 2.0);
     } else if use_adr {
         // Pure-Gaussian, no compact support — keep AdR formula.
         let log_term = log(255.0 * opacity);

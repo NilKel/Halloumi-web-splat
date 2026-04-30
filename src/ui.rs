@@ -167,14 +167,20 @@ pub(crate) fn ui(state: &mut WindowContext) -> bool {
                 ui.label("Compute Raster (G)");
                 ui.checkbox(&mut state.compute_raster_enabled, "");
                 ui.end_row();
+
+                // Tight-beta AABB applies to BOTH paths (HW preprocess +
+                // vertex filter_r AND compute preprocess). When OFF, beta
+                // kernels fall back to the legacy AdR formula (matches
+                // CUDA --aabb adr).
+                ui.label("Tight Beta AABB");
+                ui.checkbox(&mut state.splatting_args.tight_beta_bbox, "");
+                ui.end_row();
+
                 if !state.compute_raster_enabled {
-                    // HW-raster-only AABB toggle: SnugBox conic-derived bbox
-                    // vs the compute_aabb direct form. Math-equivalent for
-                    // non-degenerate splats but uses the cross-product
-                    // coefficient form (more stable at edge-on tilts) and
-                    // shares its conic with a future AccuTile port.
-                    // AccuTile (per-tile ellipse intersection) is not
-                    // wired yet — only meaningful in the compute path.
+                    // HW-raster-only: SnugBox conic-derived bbox vs the
+                    // compute_aabb direct form. Math-equivalent for non-
+                    // degenerate splats but uses cross-product coefficients
+                    // (more stable at edge-on tilts).
                     ui.label("SnugBox AABB (HW)");
                     ui.checkbox(&mut state.splatting_args.snugbox_hw, "");
                     ui.end_row();

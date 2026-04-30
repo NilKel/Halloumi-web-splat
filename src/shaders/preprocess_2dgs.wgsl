@@ -101,7 +101,9 @@ struct RenderSettings {
     //    compute_aabb on degenerate conic. AccuTile (compute-path tile
     //    intersection) is NOT in this build — see docs.
     snugbox_hw: u32,
-    _pad2: u32,
+    // 1 = tight cutoff = k for beta kernels (default).
+    // 0 = legacy AdR formula (max(r_beta, r_lp), capped at k+2).
+    tight_beta_bbox: u32,
     center: vec4<f32>,
 }
 
@@ -353,20 +355,35 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
     );
 
     // Beta kernels have COMPACT SUPPORT — `(1 − ρ3d/k²)^shape` is exactly
-    // zero for ρ3d > k². So the bbox doesn't need any 4σ slack: just the
-    // projection of the disk at the kernel's hard edge. The rho2d
-    // antialiasing tail (Gaussian floor) extends past the disk in pixel
-    // space, but its contribution at the disk edge is already low enough
-    // that ignoring it for bbox purposes is "close enough" — no AdR pad.
+    // zero for ρ3d > k². So when `tight_beta_bbox` is enabled (default),
+    // bbox cutoff = k directly. When disabled, fall back to the legacy AdR
+    // formula (matches CUDA aabb_mode=3).
     //
-    // Pure-Gaussian kernel (kernel_type 0) has no compact support; it
-    // still needs the AdR log-opacity formula.
+    // Pure-Gaussian kernel (kernel_type 0) has no compact support; always
+    // uses the AdR log-opacity formula regardless of `tight_beta_bbox`.
     var cutoff: f32;
-    if render_settings.kernel_type == 4u {
-        cutoff = 3.0;  // BetaScaled: hard support at ρ3d ≤ 9
-    } else if render_settings.kernel_type == 1u {
-        cutoff = 1.0;  // Beta: hard support at ρ3d ≤ 1
+    let kt = render_settings.kernel_type;
+    let tight = render_settings.tight_beta_bbox == 1u;
+    if (kt == 4u || kt == 1u) && tight {
+        // Beta-compact path: cutoff = k.
+        if kt == 4u { cutoff = 3.0; } else { cutoff = 1.0; }
+    } else if kt == 4u || kt == 1u {
+        // Beta-AdR fallback: max(r_beta, r_lp), capped at k+2.
+        var k: f32; if kt == 4u { k = 3.0; } else { k = 1.0; }
+        let ratio = 1.0 / (255.0 * opacity);
+        var r_beta = 0.0;
+        let threshold = pow(ratio, 1.0 / max(shape, 1e-20));
+        if threshold < 1.0 {
+            r_beta = k * sqrt(1.0 - threshold);
+        }
+        var r_lp = 0.0;
+        let log_term = log(255.0 * opacity);
+        if log_term > 0.0 {
+            r_lp = sqrt(2.0 * log_term);
+        }
+        cutoff = min(max(r_beta, r_lp), k + 2.0);
     } else {
+        // Pure-Gaussian AdR.
         let log_term = log(255.0 * opacity);
         if log_term > 0.0 {
             cutoff = sqrt(2.0 * log_term * render_settings.compact_mult);

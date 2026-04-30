@@ -334,6 +334,7 @@ impl WindowContext {
                 scene_extend: None,
                 background_color: wgpu::Color::BLACK,
                 snugbox_hw: false,
+                tight_beta_bbox: true,
             },
             pc,
             // camera: view_camera,

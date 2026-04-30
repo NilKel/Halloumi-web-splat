@@ -64,7 +64,10 @@ struct TexParams {
     res_bias: f32,
     viewport_w: u32,
     viewport_h: u32,
-    _pad0: u32,
+    // 1 = tight beta-compact-support cutoff (k = 1 or 3) for filter_r margin.
+    // 0 = legacy 4σ. Mirrors render_settings.tight_beta_bbox; refreshed each
+    // frame from SplattingArgs in renderer.preprocess.
+    tight_beta_bbox: u32,
     _pad1: u32,
 };
 
@@ -96,16 +99,18 @@ fn vs_main(
     let extent_pix = unpack2x16float(splat.extent);
 
     // CUDA's rect: max(extent, filter_r) on each axis. filter_r = cutoff·FilterSize.
-    // Cutoff matches preprocess_2dgs.wgsl: tight beta-compact-support for
-    // beta kernels (k=3 for BetaScaled, k=1 for Beta), 4σ for pure Gaussian.
-    // Without this, the quad keeps the legacy 4σ filter_r margin (~2.83 px)
-    // even when preprocess wrote a tight beta extent_pix — wasting fragment
-    // shader invocations on covered-but-zero-contribution pixels.
+    // Cutoff matches preprocess_2dgs.wgsl: tight beta-compact-support (k=3 or
+    // k=1) when tight_beta_bbox is set, else the legacy 4σ. Without this
+    // dispatch, the quad keeps a 4σ filter_r margin (~2.83 px) even when
+    // preprocess wrote a tight beta extent_pix — wasting fragment-shader
+    // invocations on covered-but-zero-contribution pixels.
     var quad_cutoff = CUTOFF;
-    if tex_params.kernel_type == 4u {
-        quad_cutoff = 3.0;
-    } else if tex_params.kernel_type == 1u {
-        quad_cutoff = 1.0;
+    if tex_params.tight_beta_bbox == 1u {
+        if tex_params.kernel_type == 4u {
+            quad_cutoff = 3.0;
+        } else if tex_params.kernel_type == 1u {
+            quad_cutoff = 1.0;
+        }
     }
     let filter_r = quad_cutoff * FILTER_SIZE;
     let half = vec2<f32>(max(extent_pix.x, filter_r), max(extent_pix.y, filter_r));

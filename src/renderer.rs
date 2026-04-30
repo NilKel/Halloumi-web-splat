@@ -40,7 +40,11 @@ pub struct TexParamsUniform {
 
     pub viewport_w: u32,
     pub viewport_h: u32,
-    pub _pad0: u32,
+    /// 1 = tight beta-compact-support cutoff (k for kernel_type 1/4), used in
+    /// the HW vertex shader's filter_r and elsewhere. 0 = legacy AdR formula
+    /// (matches CUDA bake_render's aabb_mode=3 behavior). GUI-toggleable so
+    /// you can A/B compare the two paths visually.
+    pub tight_beta_bbox: u32,
     pub _pad1: u32,
 }
 
@@ -57,7 +61,7 @@ impl Default for TexParamsUniform {
             res_bias: 0.0,
             viewport_w: 0,
             viewport_h: 0,
-            _pad0: 0,
+            tight_beta_bbox: 1,
             _pad1: 0,
         }
     }
@@ -271,7 +275,7 @@ impl GaussianRenderer {
                         res_bias: pc.map_or(0.0, |p| p.res_bias()),
                         viewport_w: 0,  // updated each frame in `preprocess`
                         viewport_h: 0,
-                        _pad0: 0,
+                        tight_beta_bbox: 1,  // updated each frame in `preprocess`
                         _pad1: 0,
                     };
                     log::info!(
@@ -430,10 +434,13 @@ impl GaussianRenderer {
 
         // Refresh tex_params.viewport so the 2DGS fragment shader can compute
         // rho2d for `alpha_lp = exp(-rho2d/2)` (CUDA's screen-space low-pass).
+        // Also propagate the tight_beta_bbox toggle so the HW vertex shader
+        // picks the matching filter_r margin (3.0/1.0 vs 4.0).
         if let Some(tp) = self.tex_params.as_mut() {
             let v = tp.as_mut();
             v.viewport_w = viewport.x;
             v.viewport_h = viewport.y;
+            v.tight_beta_bbox = render_settings.tight_beta_bbox as u32;
             tp.sync(queue);
         }
 
@@ -1141,6 +1148,13 @@ pub struct SplattingArgs {
     /// back to compute_aabb on degenerate conic. Math-equivalent for non-
     /// degenerate splats; numerically more stable at edge-on tilts.
     pub snugbox_hw: bool,
+    /// When true, beta kernels (kernel_type 1, 4) use the tight compact-
+    /// support cutoff (k = 1 or 3) for both bbox and the HW vertex shader's
+    /// filter_r margin. When false, falls back to the AdR formula (CUDA
+    /// aabb_mode=3 behavior) — wider bboxes with the `k+2` clamp. Toggle
+    /// to A/B compare the two — useful for debugging or matching the
+    /// `--aabb adr` mode of `render_baked.py`.
+    pub tight_beta_bbox: bool,
 }
 
 pub const DEFAULT_KERNEL_SIZE: f32 = 0.3;
@@ -1172,7 +1186,9 @@ pub struct SplattingArgsUniform {
     //     HW raster only. AccuTile (compute path tile intersection) is not
     //     ported in this build. See preprocess_2dgs.wgsl :: compute_aabb_snugbox.
     snugbox_hw: u32,
-    _pad2: u32,
+    // 1 = tight beta-compact-support cutoff (k = 1 or 3) for beta kernels.
+    // 0 = legacy AdR formula (matches `--aabb adr` from render_baked.py).
+    tight_beta_bbox: u32,
 
     scene_center: Vector4<f32>,
 }
@@ -1211,6 +1227,7 @@ impl SplattingArgsUniform {
             sb_number: pc.sb_number(),
             kernel_type: pc.kernel_type(),
             snugbox_hw: args.snugbox_hw as u32,
+            tight_beta_bbox: args.tight_beta_bbox as u32,
             ..Default::default()
         }
     }
@@ -1238,7 +1255,7 @@ impl Default for SplattingArgsUniform {
             sb_number: 0,
             kernel_type: 0,
             snugbox_hw: 0,
-            _pad2: 0,
+            tight_beta_bbox: 1,
         }
     }
 }

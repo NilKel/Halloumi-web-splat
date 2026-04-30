@@ -1077,13 +1077,33 @@ pub async fn open_window<R: Read + Seek + Send + Sync + 'static>(
                 last = now;
 
                 let old_settings = state.splatting_args.clone();
+                // Track settings that live on WindowContext (not in SplattingArgs).
+                // The egui ComboBoxes and the atlas/compute checkboxes mutate these,
+                // and without this snapshot the redraw_scene gate would never see
+                // the change → tex_params / pipeline / atlas state stays stale.
+                let old_atlas_enabled        = state.atlas_enabled;
+                let old_compute_raster       = state.compute_raster_enabled;
+                let old_kernel_type_override = state.kernel_type_override;
+                let old_aabb_mode            = state.aabb_mode;
+                let old_tile_size            = state.tile_size;
+
                 state.update(dt);
 
                 let (redraw_ui,shapes) = state.ui();
 
                 let resolution_change = state.splatting_args.viewport != Vector2::new(state.config.width, state.config.height);
 
-                let request_redraw = old_settings != state.splatting_args || resolution_change || state.needs_prepare;
+                let context_settings_changed =
+                    old_atlas_enabled        != state.atlas_enabled
+                    || old_compute_raster       != state.compute_raster_enabled
+                    || old_kernel_type_override != state.kernel_type_override
+                    || old_aabb_mode            != state.aabb_mode
+                    || old_tile_size            != state.tile_size;
+
+                let request_redraw = old_settings != state.splatting_args
+                    || context_settings_changed
+                    || resolution_change
+                    || state.needs_prepare;
                 if request_redraw {
                     state.needs_prepare = false;
                 }

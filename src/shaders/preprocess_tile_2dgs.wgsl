@@ -428,13 +428,19 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>) {
     if opacity < (1.0 / 255.0) {
         return;
     }
-    // Fixed 4σ cutoff for ALL kernels — matches CUDA aabb_mode=2 (rect, no
-    // AdR) which is the simplest, most-correct path. Beta kernels still
-    // discard fragments past their compact support in tile_raster's per-
-    // pixel inner loop (rho3d >= k_sq + ε → return). Tighter cutoffs are a
-    // perf optimization not a correctness one — disabled until we get the
-    // raw path matching.
-    let cutoff: f32 = 4.0;
+
+    // Cutoff selection mirrors HW preprocess_2dgs.wgsl. Beta kernels with
+    // tight_beta_bbox=1 use cutoff=k (their compact-support edge); else
+    // fall back to 4σ (CUDA aabb_mode=2). Pure-Gaussian uses 4σ always.
+    var cutoff: f32;
+    let tight = render_settings.tight_beta_bbox == 1u;
+    if (KERNEL_TYPE == 4u) && tight {
+        cutoff = 3.0;
+    } else if (KERNEL_TYPE == 1u) && tight {
+        cutoff = 1.0;
+    } else {
+        cutoff = 4.0;
+    }
 
     // Compute AABB from transmat
     let aabb = compute_aabb(T_mat, cutoff);

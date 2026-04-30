@@ -21,8 +21,18 @@ use egui_plot::{Legend, PlotPoints};
 
 pub(crate) fn ui(state: &mut WindowContext) -> bool {
     let ctx = state.ui_renderer.winit.egui_ctx();
+
+    // Throttle the two GPU-stalling readbacks (timestamp resolve + visible-
+    // count) to once every 30 frames — at 300 fps that's ~10 Hz panel update,
+    // plenty for a debug stat. Stagger them by 15 frames so the two stalls
+    // never coincide on a single frame.
     #[cfg(not(target_arch = "wasm32"))]
-    if !state.compute_raster_enabled {
+    {
+        state.frame_count = state.frame_count.wrapping_add(1);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    if !state.compute_raster_enabled && state.frame_count % 30 == 0 {
         if let Some(stopwatch) = state.stopwatch.as_mut() {
             let durations = pollster::block_on(
                 stopwatch.take_measurements(&state.wgpu_context.device, &state.wgpu_context.queue),
@@ -39,11 +49,14 @@ pub(crate) fn ui(state: &mut WindowContext) -> bool {
     let num_drawn = if state.compute_raster_enabled {
         0 // Skip GPU readback stall in compute raster mode
     } else {
-        pollster::block_on(
-            state
-                .renderer
-                .num_visible_points(&state.wgpu_context.device, &state.wgpu_context.queue),
-        )
+        if state.frame_count % 30 == 15 {
+            state.cached_num_drawn = pollster::block_on(
+                state
+                    .renderer
+                    .num_visible_points(&state.wgpu_context.device, &state.wgpu_context.queue),
+            );
+        }
+        state.cached_num_drawn
     };
     #[cfg(not(target_arch = "wasm32"))]
     egui::Window::new("Render Stats")

@@ -190,6 +190,16 @@ pub struct WindowContext {
     cameras_save_path: String,
     stopwatch: Option<GPUStopwatch>,
     needs_prepare: bool,
+
+    // Throttled-readback cache. Both `take_measurements` and
+    // `num_visible_points` `device.poll(wait_indefinitely)` which stalls the
+    // CPU until the entire GPU pipeline drains — typically 2-5 ms each on
+    // Apple Silicon, capping FPS around 200 even when the scene is empty.
+    // Reading them every 30 frames instead of every frame keeps the panel
+    // updating at ~10 Hz (plenty for stat display) while burying the stall
+    // cost in idle time.
+    pub(crate) frame_count: u64,
+    pub(crate) cached_num_drawn: u32,
 }
 
 impl WindowContext {
@@ -356,6 +366,8 @@ impl WindowContext {
 
             stopwatch,
             needs_prepare: true,
+            frame_count: 0,
+            cached_num_drawn: 0,
             atlas_enabled: true,
             compute_raster_enabled: render_config.compute_raster,
             tile_raster: None,
@@ -516,27 +528,36 @@ impl WindowContext {
                 }
             }
 
-            // Compute raster path
-            let mut compute_encoder =
-                self.wgpu_context
-                    .device
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("compute raster encoder"),
-                    });
+            // Compute raster path. Skipped entirely when the camera is
+            // bit-stable (redraw_scene == false): the previous frame's
+            // tile_raster.output_buf is reused by the fullscreen-copy pass.
+            if redraw_scene {
+                let mut compute_encoder =
+                    self.wgpu_context
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("compute raster encoder"),
+                        });
 
-            if let Some(ref mut tr) = self.tile_raster {
-                tr.prepare(
-                    &mut compute_encoder,
-                    &self.wgpu_context.queue,
-                    &self.pc,
-                    self.renderer.sorter(),
-                    self.splatting_args,
-                );
+                if let Some(ref mut tr) = self.tile_raster {
+                    tr.prepare(
+                        &mut compute_encoder,
+                        &self.wgpu_context.queue,
+                        &self.pc,
+                        self.renderer.sorter(),
+                        self.splatting_args,
+                    );
+                }
+
+                self.wgpu_context.queue.submit([compute_encoder.finish()]);
             }
-
-            self.wgpu_context.queue.submit([compute_encoder.finish()]);
-        } else {
-            // Hardware raster path: preprocess + sort
+        } else if redraw_scene {
+            // Hardware raster path: preprocess + sort. Skipped entirely
+            // when redraw_scene == false (camera is bit-stable from last
+            // frame) — splats_2d / sort_indices / draw_indirect from the
+            // previous frame are still valid and the render pass below
+            // re-uses them. This drops idle-frame work from ~5 ms to
+            // ~1 ms on Mac and is the largest static-camera win.
             {
                 let mut compute_encoder =
                     self.wgpu_context

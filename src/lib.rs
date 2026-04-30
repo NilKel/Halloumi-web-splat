@@ -498,7 +498,19 @@ impl WindowContext {
             ..Default::default()
         });
         let view_srgb = output.texture.create_view(&Default::default());
-        // do prepare stuff
+
+        // Single encoder for the entire frame: preprocess + sort compute
+        // passes (when redraw_scene == true), then the render pass(es), and
+        // the final timestamp resolve. One queue.submit at the end. Saves
+        // the per-submit Metal command-buffer overhead (~0.1-0.3 ms each on
+        // Apple Silicon) and lets wgpu auto-insert tighter compute→render
+        // barriers without crossing a submit boundary.
+        let mut encoder =
+            self.wgpu_context
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("frame encoder"),
+                });
 
         if self.compute_raster_enabled {
             // Recreate pipeline if settings changed or window resized
@@ -532,73 +544,46 @@ impl WindowContext {
             // bit-stable (redraw_scene == false): the previous frame's
             // tile_raster.output_buf is reused by the fullscreen-copy pass.
             if redraw_scene {
-                let mut compute_encoder =
-                    self.wgpu_context
-                        .device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("compute raster encoder"),
-                        });
-
                 if let Some(ref mut tr) = self.tile_raster {
                     tr.prepare(
-                        &mut compute_encoder,
+                        &mut encoder,
                         &self.wgpu_context.queue,
                         &self.pc,
                         self.renderer.sorter(),
                         self.splatting_args,
                     );
                 }
-
-                self.wgpu_context.queue.submit([compute_encoder.finish()]);
             }
         } else if redraw_scene {
             // Hardware raster path: preprocess + sort. Skipped entirely
             // when redraw_scene == false (camera is bit-stable from last
             // frame) — splats_2d / sort_indices / draw_indirect from the
             // previous frame are still valid and the render pass below
-            // re-uses them. This drops idle-frame work from ~5 ms to
-            // ~1 ms on Mac and is the largest static-camera win.
-            {
-                let mut compute_encoder =
-                    self.wgpu_context
-                        .device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("compute command encoder"),
-                        });
-
-                // Update atlas toggle before rendering
-                if let Some(ref mut tp) = self.renderer.tex_params {
-                    let w = if self.atlas_enabled { self.pc.atlas_width() } else { 0 };
-                    tp.as_mut().atlas_width = w;
-                    tp.sync(&self.wgpu_context.queue);
-                }
-                if let Some(ref mut tr) = self.tile_raster {
-                    tr.set_atlas_enabled(self.atlas_enabled, self.pc.atlas_width());
-                }
-
-                // Wire the stopwatch through so renderer.prepare records
-                // "preprocess" and "sorting" timestamps. None on macOS/iOS
-                // (TIMESTAMP_QUERY unavailable), where ui.rs reads zeros.
-                self.renderer.prepare(
-                    &mut compute_encoder,
-                    &self.wgpu_context.device,
-                    &self.wgpu_context.queue,
-                    &self.pc,
-                    self.splatting_args,
-                    &mut self.stopwatch,
-                );
-
-                self.wgpu_context.queue.submit([compute_encoder.finish()]);
+            // re-uses them.
+            //
+            // Update atlas toggle before rendering (queue.write_buffer ops
+            // are independent of the encoder).
+            if let Some(ref mut tp) = self.renderer.tex_params {
+                let w = if self.atlas_enabled { self.pc.atlas_width() } else { 0 };
+                tp.as_mut().atlas_width = w;
+                tp.sync(&self.wgpu_context.queue);
             }
-        }
+            if let Some(ref mut tr) = self.tile_raster {
+                tr.set_atlas_enabled(self.atlas_enabled, self.pc.atlas_width());
+            }
 
-        // Submit 2: render pass
-        let mut encoder =
-            self.wgpu_context
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("render command encoder"),
-                });
+            // Wire the stopwatch through so renderer.prepare records
+            // "preprocess" and "sorting" timestamps. None on macOS/iOS
+            // (TIMESTAMP_QUERY unavailable), where ui.rs reads zeros.
+            self.renderer.prepare(
+                &mut encoder,
+                &self.wgpu_context.device,
+                &self.wgpu_context.queue,
+                &self.pc,
+                self.splatting_args,
+                &mut self.stopwatch,
+            );
+        }
 
         let ui_state = shapes.map(|shapes| {
             self.ui_renderer.prepare(

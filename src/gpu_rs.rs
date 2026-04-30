@@ -33,6 +33,11 @@ pub struct GPURSSorter {
     block_offsets_odd_p: wgpu::ComputePipeline,
     scatter_even_p: wgpu::ComputePipeline,
     scatter_odd_p: wgpu::ComputePipeline,
+    /// Compute pipeline + BGL for `record_pad_sort_keys` — fills the kpw
+    /// padding region after preprocess writes `keys_size`. Replaces the
+    /// per-frame 4 MB sort_keys → sort_keys copy with a 15-workgroup pass.
+    pad_keys_p: wgpu::ComputePipeline,
+    pad_keys_bgl: wgpu::BindGroupLayout,
     subgroup_size: usize,
 }
 
@@ -49,7 +54,12 @@ pub struct PointCloudSortStuff {
     /// Same size as `sort_keys_buffer`, prefilled with 0xFF bytes once at
     /// creation. Copied into `sort_keys_buffer` at the start of each frame to
     /// pad slack slots with `+∞` so they never sort into the visible range.
+    /// Now unused by the renderer (replaced by `record_pad_sort_keys`); kept
+    /// in the struct for any external callers / future fallback path.
+    #[allow(dead_code)]
     pub(crate) sort_keys_fill: wgpu::Buffer,
+    /// Bind group for `record_pad_sort_keys`: sort_infos (read) + sort_keys (rw).
+    pub(crate) pad_keys_bg: wgpu::BindGroup,
 }
 
 #[allow(dead_code)]
@@ -178,11 +188,24 @@ impl GPURSSorter {
         // Pre-build a 0xFF-filled staging buffer the same size as the sort
         // keys buffer, used each frame to reset slack slots to +∞ before
         // preprocess writes valid keys (see `record_reset_sort_keys`).
+        // Now unused — replaced by `record_pad_sort_keys` (small compute
+        // pass) — but kept for potential fallback.
         let sort_keys_size = sorter_b_a.size();
         let sort_keys_fill = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("sort keys fill (0xFF)"),
             contents: &vec![0xFFu8; sort_keys_size as usize],
             usage: wgpu::BufferUsages::COPY_SRC,
+        });
+
+        // Pad-keys bind group: sort_infos (read for keys_size) + the keys
+        // buffer (rw to fill the kpw padding region).
+        let pad_keys_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("pad_sort_keys bg"),
+            layout: &self.pad_keys_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: sorter_uni.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: sorter_b_a.as_entire_binding() },
+            ],
         });
 
         PointCloudSortStuff {
@@ -196,6 +219,7 @@ impl GPURSSorter {
             sort_keys_buffer: sorter_b_a,
             sort_indices_buffer: sorter_p_a,
             sort_keys_fill,
+            pad_keys_bg,
         }
     }
 
@@ -336,6 +360,54 @@ impl GPURSSorter {
             cache: None,
         });
 
+        // pad_sort_keys: small per-frame compute pass that fills the
+        // dispatch_x*kpw - keys_size padding slots with 0xFF sentinels.
+        // Replaces a 4 MB queue-side buffer copy with ~15 KB of writes.
+        let pad_keys_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("pad_sort_keys bg layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let pad_keys_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("pad_sort_keys pipeline layout"),
+            bind_group_layouts: &[&pad_keys_bgl],
+            push_constant_ranges: &[],
+        });
+        let pad_keys_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("pad_sort_keys shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("shaders/pad_sort_keys.wgsl").into(),
+            ),
+        });
+        let pad_keys_p = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("pad_sort_keys"),
+            layout: Some(&pad_keys_pl),
+            module: &pad_keys_shader,
+            entry_point: Some("pad"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
         return Self {
             bind_group_layout,
             render_bind_group_layout,
@@ -349,6 +421,8 @@ impl GPURSSorter {
             block_offsets_odd_p,
             scatter_even_p,
             scatter_odd_p,
+            pad_keys_p,
+            pad_keys_bgl,
             subgroup_size: histogram_sg_size,
         };
     }
@@ -830,6 +904,32 @@ impl GPURSSorter {
             0,
             sort_keys_buffer.size(),
         );
+    }
+
+    /// Per-frame replacement for `record_reset_sort_keys`: fills only the
+    /// `[keys_size, keys_size + keys_per_wg)` padding region with 0xFF
+    /// sentinels using a tiny compute dispatch (15 workgroups × 256 threads
+    /// = ~15 KB written) instead of a full-buffer copy (~4 MB at 1M points).
+    /// Must run AFTER preprocess (which sets `sort_infos.keys_size`) and
+    /// BEFORE `record_sort_indirect`.
+    ///
+    /// Slots past `keys_size + keys_per_wg` are stale from prior frames but
+    /// never read by the sort: dispatch_x = ceil(keys_size / keys_per_wg)
+    /// caps the sort range at `dispatch_x * keys_per_wg ≤ keys_size + kpw`.
+    pub fn record_pad_sort_keys(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        bind_group: &wgpu::BindGroup,
+    ) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("pad_sort_keys"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.pad_keys_p);
+        pass.set_bind_group(0, bind_group, &[]);
+        // 15 workgroups × 256 threads = 3840 = HISTOGRAM_WG_SIZE *
+        // RS_HISTOGRAM_BLOCK_ROWS. Covers the full kpw padding region.
+        pass.dispatch_workgroups(RS_HISTOGRAM_BLOCK_ROWS as u32, 1, 1);
     }
 
     pub fn record_calculate_histogram(

@@ -673,12 +673,20 @@ impl TileRasterPipeline {
                 label: Some("preprocess tile shader"),
                 source: wgpu::ShaderSource::Wgsl(preprocess_tile_shader_src.into()),
             });
+        // 2DGS path uses the extended pointcloud bind group with sb_params
+        // at binding 3 (so preprocess_tile_2dgs can fold SB lobes into the
+        // per-Gaussian color). 3DGS path keeps the original 3-binding layout.
+        let pc_bgl = if is_2dgs {
+            PointCloud::bind_group_layout_2dgs(device)
+        } else {
+            PointCloud::bind_group_layout(device)
+        };
         let preprocess_tile_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("preprocess tile pipeline layout"),
                 bind_group_layouts: &[
                     &UniformBuffer::<CameraUniform>::bind_group_layout(device),
-                    &PointCloud::bind_group_layout(device),
+                    &pc_bgl,
                     &preprocess_sort_bgl,
                     &preprocess_tile_bg3_layout,
                 ],

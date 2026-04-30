@@ -107,6 +107,7 @@ async fn render_views(
                 scene_center: None,
                 scene_extend: None,
                 background_color: wgpu::Color::BLACK,
+                snugbox_hw: false,
             },
             &mut None,
         );

@@ -45,8 +45,25 @@ struct PrefixSumInfoUniform {
 struct DuplicateInfoUniform {
     num_visible: u32,
     tiles_x: u32,
-    _pad0: u32,
+    // Pixel size of one tile (8/16/32). AccuTile per-row x-extent
+    // computation needs to know the tile-pixel boundaries to convert tile
+    // indices (rect_min/rect_max) into pixel coords for the ellipse
+    // intersection math. Was `_pad0` before AccuTile.
+    tile_size: u32,
     _pad1: u32,
+}
+
+/// 8-float (32-byte) per-Gaussian conic data for AccuTile in duplicate_keys:
+/// `abet = (A, B, E, t)` from the conic Q(px,py) = A·dx² + 2B·dx·dy + E·dy² ≤ t,
+/// plus center `p` (pixel coords). `t ≤ 0` → conic was degenerate; emit phase
+/// falls back to the rect-AABB enumeration. 32-byte stride keeps WGSL vec4
+/// alignment without needing a manual `array<f32, 6>` indexing.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct EllipseConicData {
+    abet: [f32; 4],
+    p: [f32; 2],
+    _pad: [f32; 2],
 }
 
 /// Uniform for viewport info (fullscreen copy)
@@ -101,6 +118,7 @@ pub struct TileRasterPipeline {
     // Buffers
     tiles_touched_buf: wgpu::Buffer,
     rect_data_buf: wgpu::Buffer,
+    conic_data_buf: wgpu::Buffer,
     depth_16_buf: wgpu::Buffer,
     prefix_sum_block_sums: wgpu::Buffer,
     tile_starts_buf: wgpu::Buffer,
@@ -207,7 +225,7 @@ impl TileRasterPipeline {
             DuplicateInfoUniform {
                 num_visible: num_points,
                 tiles_x,
-                _pad0: 0,
+                tile_size,
                 _pad1: 0,
             },
             Some("duplicate info uniform"),
@@ -236,6 +254,16 @@ impl TileRasterPipeline {
         let rect_data_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rect_data"),
             size: (num_points as u64) * 16, // vec4<u32> = 16 bytes
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // EllipseConicData = 8 floats × 4 bytes = 32 bytes per visible Gaussian.
+        // Written by preprocess_tile_2dgs (A, B, E, t, p.x, p.y, _, _), read by
+        // duplicate_keys for AccuTile per-row pruning.
+        let conic_data_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("conic_data"),
+            size: (num_points as u64) * 32,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -384,6 +412,7 @@ impl TileRasterPipeline {
                     storage_rw_entry(3), // depth_16
                     uniform_entry(4),    // tile_info
                     storage_ro_entry(5), // sb_params (dummy buffer when sb_number = 0)
+                    storage_rw_entry(6), // conic_data (AccuTile per-Gaussian conic)
                 ],
             });
 
@@ -396,6 +425,7 @@ impl TileRasterPipeline {
             &depth_16_buf,
             &tile_info,
             None, // no pc yet — use dummy
+            &conic_data_buf,
         );
 
         // Prefix sum: data(rw) + block_sums(rw) + info(uniform)
@@ -427,7 +457,9 @@ impl TileRasterPipeline {
             ],
         });
 
-        // Duplicate keys: tile_offsets(read) + rect_data(read) + depth_vals(read) + tile_keys(rw) + tile_payloads(rw) + info(uniform) + sort_infos(read)
+        // Duplicate keys: tile_offsets(read) + rect_data(read) + depth_vals(read)
+        // + tile_keys(rw) + tile_payloads(rw) + info(uniform) + sort_infos(read)
+        // + conic_data(read) for AccuTile per-row pruning.
         let duplicate_keys_bgl =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("duplicate keys bg layout"),
@@ -439,6 +471,7 @@ impl TileRasterPipeline {
                     storage_rw_entry(4),
                     uniform_entry(5),
                     storage_ro_entry(6), // sort_infos (num_visible)
+                    storage_ro_entry(7), // conic_data
                 ],
             });
 
@@ -473,6 +506,10 @@ impl TileRasterPipeline {
                 wgpu::BindGroupEntry {
                     binding: 6,
                     resource: preprocess_sort_uni.as_entire_binding(), // sort_infos with keys_size
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: conic_data_buf.as_entire_binding(),
                 },
             ],
         });
@@ -895,6 +932,7 @@ impl TileRasterPipeline {
 
             tiles_touched_buf,
             rect_data_buf,
+            conic_data_buf,
             depth_16_buf,
             prefix_sum_block_sums,
             tile_starts_buf,
@@ -966,6 +1004,7 @@ impl TileRasterPipeline {
         depth_16: &wgpu::Buffer,
         tile_info: &UniformBuffer<TileInfoUniform>,
         sb_params_buf: Option<&wgpu::Buffer>,
+        conic_data: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         let dummy_sb;
         let sb_resource = if let Some(buf) = sb_params_buf {
@@ -990,6 +1029,7 @@ impl TileRasterPipeline {
                 wgpu::BindGroupEntry { binding: 3, resource: depth_16.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: tile_info.buffer().as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: sb_resource },
+                wgpu::BindGroupEntry { binding: 6, resource: conic_data.as_entire_binding() },
             ],
         })
     }
@@ -1136,6 +1176,7 @@ impl TileRasterPipeline {
             &self.depth_16_buf,
             &self.tile_info,
             pc.sb_params_buffer(),
+            &self.conic_data_buf,
         );
     }
 

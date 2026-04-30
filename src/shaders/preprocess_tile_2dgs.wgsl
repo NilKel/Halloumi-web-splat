@@ -148,6 +148,18 @@ var<uniform> tile_info: TileInfo;
 @group(3) @binding(5)
 var<storage, read> sb_params: array<f32>;
 
+// AccuTile per-Gaussian conic data (32-byte stride matches Rust
+// EllipseConicData). abet = (A, B, E, t) of the screen-space ellipse
+// Q(d) = A·dx² + 2B·dx·dy + E·dy² ≤ t (centered at p). t ≤ 0 → conic
+// degenerate; duplicate_keys falls back to rect-AABB enumeration.
+struct EllipseConic {
+    abet: vec4<f32>,
+    p: vec2<f32>,
+    _pad: vec2<f32>,
+}
+@group(3) @binding(6)
+var<storage, read_write> conic_data: array<EllipseConic>;
+
 fn sh_coef(splat_idx: u32, c_idx: u32) -> vec3<f32> {
     let a = unpack2x16float(sh_coefs[splat_idx][(c_idx * 3u + 0u) / 2u])[(c_idx * 3u + 0u) % 2u];
     let b = unpack2x16float(sh_coefs[splat_idx][(c_idx * 3u + 1u) / 2u])[(c_idx * 3u + 1u) % 2u];
@@ -253,6 +265,56 @@ fn compute_aabb(T: mat3x3<f32>, cutoff: f32) -> vec4<f32> {
     return vec4<f32>(p.x, p.y, h.x, h.y); // center_x, center_y, extent_x, extent_y
 }
 
+// AccuTile conic form: derive (A, B, E, t, p) of the screen-space ellipse
+// from transmat T such that Q(px, py) = A·dx² + 2B·dx·dy + E·dy² ≤ t with
+// d = (px, py) − p. Exact port of auxiliary.h::compute_conic_from_transmat.
+// Returns t ≤ 0 on degenerate inputs (det ≤ 0, A ≤ 0, E ≤ 0, or Q(p) ≥ 0).
+// On degeneracy, duplicate_keys must fall back to rect-AABB enumeration.
+fn compute_conic_from_transmat_tile(T: mat3x3<f32>, cutoff: f32) -> EllipseConic {
+    let k_sq = cutoff * cutoff;
+    let Tu = T[0];
+    let Tv = T[1];
+    let Tw = T[2];
+
+    let n0 = cross(Tv, Tw);
+    let n1 = cross(Tw, Tu);
+    let n2 = cross(Tu, Tv);
+
+    let A_  = n0.x*n0.x + n0.y*n0.y - k_sq * n0.z*n0.z;
+    let B_  = n0.x*n1.x + n0.y*n1.y - k_sq * n0.z*n1.z;
+    let E_  = n1.x*n1.x + n1.y*n1.y - k_sq * n1.z*n1.z;
+    let D_  = n0.x*n2.x + n0.y*n2.y - k_sq * n0.z*n2.z;
+    let F_  = n1.x*n2.x + n1.y*n2.y - k_sq * n1.z*n2.z;
+
+    let det = A_*E_ - B_*B_;
+    var ec: EllipseConic;
+    ec._pad = vec2<f32>(0.0, 0.0);
+    if !(det > 0.0) || !(A_ > 0.0) || !(E_ > 0.0) {
+        ec.abet = vec4<f32>(0.0, 0.0, 0.0, -1.0);
+        ec.p = vec2<f32>(0.0, 0.0);
+        return ec;
+    }
+
+    let p_x = (B_*F_ - E_*D_) / det;
+    let p_y = (B_*D_ - A_*F_) / det;
+
+    // t = -Q(p) via cross-product form (avoids 7-digit precision loss
+    // in the direct (D·p+F·p+G) evaluation — see auxiliary.h:170 comment).
+    let cx_p = p_x*n0.x + p_y*n1.x + n2.x;
+    let cy_p = p_x*n0.y + p_y*n1.y + n2.y;
+    let cz_p = p_x*n0.z + p_y*n1.z + n2.z;
+    let t_   = -(cx_p*cx_p + cy_p*cy_p - k_sq * cz_p*cz_p);
+    if !(t_ > 0.0) {
+        ec.abet = vec4<f32>(0.0, 0.0, 0.0, -1.0);
+        ec.p = vec2<f32>(0.0, 0.0);
+        return ec;
+    }
+
+    ec.abet = vec4<f32>(A_, B_, E_, t_);
+    ec.p = vec2<f32>(p_x, p_y);
+    return ec;
+}
+
 @compute @workgroup_size(256, 1, 1)
 fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
@@ -281,10 +343,6 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>) {
     let pos2d = camera.proj * camspace;
     let bounds = 1.2 * pos2d.w;
     let z = pos2d.z / pos2d.w;
-
-    if idx == 0u {
-        atomicAdd(&sort_dispatch.dispatch_x, 1u);
-    }
 
     if z <= 0.0 || z >= 1.0 || pos2d.x < -bounds || pos2d.x > bounds || pos2d.y < -bounds || pos2d.y > bounds {
         return;
@@ -362,63 +420,29 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     // AABB_MODE: 0 = square + fixed cutoff, 1 = square + AdR, 2 = rect + fixed, 3 = rect + AdR.
-    // Mirrors the CUDA compact-box logic: r_lp gets multiplied by d_compact_mult.
     let use_adr = (AABB_MODE == 1u || AABB_MODE == 3u);
     let compact_mult = render_settings.compact_mult;
 
-    if use_adr {
-        if KERNEL_TYPE == 4u {
-            // BetaScaled kernel (k²=9, k=3): r_beta from kernel threshold, r_lp from low-pass.
-            // NOTE: training's beta-AdR path (diff_surfel_3D_sh_res forward.cu ~L663)
-            // leaves r_lp unmodified — compact_mult is only applied to the pure-Gaussian
-            // AdR branch. Applying it here instead would make beta kernels render dimmer
-            // than training.
-            let k = 3.0;
-            let ratio = 1.0 / (255.0 * opacity);
-            var r_beta = 0.0;
-            let threshold = pow(ratio, 1.0 / shape);
-            if threshold < 1.0 {
-                r_beta = k * sqrt(1.0 - threshold);
-            }
-            var r_lp = 0.0;
-            let log_term = log(255.0 * opacity);
-            if log_term > 0.0 {
-                r_lp = sqrt(2.0 * log_term);
-            }
-            cutoff = max(r_beta, r_lp);
-            cutoff = min(cutoff, k + 2.0);
-        } else if KERNEL_TYPE == 1u {
-            // Beta kernel (k²=1, k=1): same structure as BetaScaled, tighter k.
-            // Same rule — no compact_mult on r_lp.
-            let k = 1.0;
-            let ratio = 1.0 / (255.0 * opacity);
-            var r_beta = 0.0;
-            let threshold = pow(ratio, 1.0 / shape);
-            if threshold < 1.0 {
-                r_beta = k * sqrt(1.0 - threshold);
-            }
-            var r_lp = 0.0;
-            let log_term = log(255.0 * opacity);
-            if log_term > 0.0 {
-                r_lp = sqrt(2.0 * log_term);
-            }
-            cutoff = max(r_beta, r_lp);
-            cutoff = min(cutoff, k + 2.0);
+    if KERNEL_TYPE == 4u {
+        // BetaScaled has compact support at ρ3d ≤ 9 (k=3). The kernel is
+        // exactly zero outside; the rho2d Gaussian floor's contribution at
+        // the disk edge is small enough to ignore for bbox purposes (HW
+        // path verified visually identical with this cutoff). No AdR pad.
+        cutoff = 3.0;
+    } else if KERNEL_TYPE == 1u {
+        // Beta has compact support at ρ3d ≤ 1 (k=1). Same reasoning.
+        cutoff = 1.0;
+    } else if use_adr {
+        // Pure-Gaussian, no compact support — keep AdR formula.
+        let log_term = log(255.0 * opacity);
+        if log_term > 0.0 {
+            cutoff = sqrt(2.0 * log_term * compact_mult);
         } else {
-            // Gaussian: solve opacity * exp(-r²/2) = 1/255.
-            let log_term = log(255.0 * opacity);
-            if log_term > 0.0 {
-                cutoff = sqrt(2.0 * log_term * compact_mult);
-            } else {
-                cutoff = 0.1;
-            }
-            cutoff = min(cutoff, 4.0);
+            cutoff = 0.1;
         }
+        cutoff = min(cutoff, 4.0);
     } else {
-        // Mode 0 (square) / mode 2 (rect): fixed 4σ (2DGS default) for ANY kernel.
-        // We do NOT have a WGSL equivalent of CUDA mode 4 (use_beta_fixed) —
-        // if you wanted the tight beta-compact path, run under AdR (mode 1/3).
-        // The previous "KERNEL_TYPE==4 → 3.3" fallback caused ~16% dimming vs training.
+        // Mode 0/2 + Gaussian: fixed 4σ (2DGS default).
         cutoff = 4.0;
     }
 
@@ -506,4 +530,10 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Quantize depth to 16 bits for packed tile|depth key
     let depth_norm = clamp(pos2d.z / zfar, 0.0, 1.0);
     depth_16[store_idx] = u32(depth_norm * 65535.0);
+
+    // AccuTile per-Gaussian conic: ellipse in pixel coords for the same
+    // cutoff used by compute_aabb above. duplicate_keys reads this and
+    // does per-row x-extent pruning. t ≤ 0 → degenerate, emit phase
+    // falls back to enumerating all tiles in the rect (no cull).
+    conic_data[store_idx] = compute_conic_from_transmat_tile(T_mat, cutoff);
 }

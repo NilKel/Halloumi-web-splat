@@ -96,7 +96,18 @@ fn vs_main(
     let extent_pix = unpack2x16float(splat.extent);
 
     // CUDA's rect: max(extent, filter_r) on each axis. filter_r = cutoff·FilterSize.
-    let filter_r = CUTOFF * FILTER_SIZE;
+    // Cutoff matches preprocess_2dgs.wgsl: tight beta-compact-support for
+    // beta kernels (k=3 for BetaScaled, k=1 for Beta), 4σ for pure Gaussian.
+    // Without this, the quad keeps the legacy 4σ filter_r margin (~2.83 px)
+    // even when preprocess wrote a tight beta extent_pix — wasting fragment
+    // shader invocations on covered-but-zero-contribution pixels.
+    var quad_cutoff = CUTOFF;
+    if tex_params.kernel_type == 4u {
+        quad_cutoff = 3.0;
+    } else if tex_params.kernel_type == 1u {
+        quad_cutoff = 1.0;
+    }
+    let filter_r = quad_cutoff * FILTER_SIZE;
     let half = vec2<f32>(max(extent_pix.x, filter_r), max(extent_pix.y, filter_r));
 
     let sx = f32(in_vertex_index % 2u == 0u) * 2.0 - 1.0;

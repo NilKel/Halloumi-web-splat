@@ -129,6 +129,7 @@ async fn render_tracking_shot(
                 scene_center: None,
                 scene_extend: None,
                 background_color: wgpu::Color::TRANSPARENT,
+                snugbox_hw: false,
             },
             &mut None,
         );

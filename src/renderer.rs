@@ -1136,6 +1136,11 @@ pub struct SplattingArgs {
     pub scene_center: Option<Point3<f32>>,
     pub scene_extend: Option<f32>,
     pub background_color: wgpu::Color,
+    /// HW-raster-only: when true, derive the screen-space bbox via the
+    /// SnugBox conic form (cross-product) instead of `compute_aabb`. Falls
+    /// back to compute_aabb on degenerate conic. Math-equivalent for non-
+    /// degenerate splats; numerically more stable at edge-on tilts.
+    pub snugbox_hw: bool,
 }
 
 pub const DEFAULT_KERNEL_SIZE: f32 = 0.3;
@@ -1162,7 +1167,11 @@ pub struct SplattingArgsUniform {
     compact_mult: f32,
     sb_number: u32,
     kernel_type: u32,
-    _pad1: u32,
+    // 0 = rect AABB via compute_aabb (default).
+    // 1 = SnugBox: derive bbox from conic Q(px,py)=0 (cross-product form).
+    //     HW raster only. AccuTile (compute path tile intersection) is not
+    //     ported in this build. See preprocess_2dgs.wgsl :: compute_aabb_snugbox.
+    snugbox_hw: u32,
     _pad2: u32,
 
     scene_center: Vector4<f32>,
@@ -1201,6 +1210,7 @@ impl SplattingArgsUniform {
             compact_mult: pc.compact_mult(),
             sb_number: pc.sb_number(),
             kernel_type: pc.kernel_type(),
+            snugbox_hw: args.snugbox_hw as u32,
             ..Default::default()
         }
     }
@@ -1227,7 +1237,7 @@ impl Default for SplattingArgsUniform {
             compact_mult: 1.0,
             sb_number: 0,
             kernel_type: 0,
-            _pad1: 0,
+            snugbox_hw: 0,
             _pad2: 0,
         }
     }

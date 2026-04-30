@@ -73,6 +73,7 @@ async fn render_views(
             scene_center: None,
             scene_extend: None,
             background_color: wgpu::Color::TRANSPARENT,
+            snugbox_hw: false,
         },
         &mut None,
     );
@@ -122,6 +123,7 @@ async fn render_views(
                     scene_center: None,
                     scene_extend: None,
                     background_color: wgpu::Color::TRANSPARENT,
+                    snugbox_hw: false,
                 },
                 &mut None,
             );

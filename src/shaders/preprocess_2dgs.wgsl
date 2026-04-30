@@ -94,7 +94,13 @@ struct RenderSettings {
     compact_mult: f32,
     sb_number: u32,
     kernel_type: u32,
-    _pad1: u32,
+    // 0: rect AABB via compute_aabb (compute_aabb path, default).
+    // 1: SnugBox conic-derived rect via compute_conic_from_transmat — same
+    //    axis-aligned bbox of the projected ellipse, but derived from
+    //    Q(px,py) = 0 directly (cross-product form). Falls back to
+    //    compute_aabb on degenerate conic. AccuTile (compute-path tile
+    //    intersection) is NOT in this build — see docs.
+    snugbox_hw: u32,
     _pad2: u32,
     center: vec4<f32>,
 }
@@ -208,6 +214,65 @@ fn compute_aabb(T: mat3x3<f32>, cutoff: f32) -> vec4<f32> {
     return vec4<f32>(p.x, p.y, h.x, h.y);
 }
 
+// SnugBox: derive the same axis-aligned bbox of the projected disk via the
+// conic Q(px, py) = 0 form, then take its principal-axis bounds.
+//
+// Math (auxiliary.h:101 in diff_surfel_bake_render):
+//   2DGS T maps (px, py, 1) → (u_h, v_h, w_h) where surfel s = (u_h/w_h,
+//   v_h/w_h). The disk s.x² + s.y² ≤ k² pulls back to
+//   u_h² + v_h² − k²·w_h² ≤ 0
+//   in homogeneous pixel coords. The render kernel uses the cross-product
+//   trick: cross_x = n0·px + n1·py + n2 where n0=Tv×Tw, n1=Tw×Tu, n2=Tu×Tv.
+//   Substituting and grouping yields a quadratic Q(px, py) =
+//     A·px² + 2B·px·py + E·py² + 2D·px + 2F·py + G ≤ 0
+//   with coefficients A,B,E,D,F derived from {n0,n1,n2}. Center p is the
+//   gradient zero (∇Q = 0) found via Cramer; t = -Q(p) is the half-axis
+//   scale. det = A·E − B² > 0 for a real ellipse.
+//
+// Returns (cx, cy, hx, hy) in pixel coords. hx<0 marks degenerate, in which
+// case the caller should fall back to compute_aabb.
+fn compute_aabb_snugbox(T: mat3x3<f32>, cutoff: f32) -> vec4<f32> {
+    let k_sq = cutoff * cutoff;
+    let Tu = T[0];
+    let Tv = T[1];
+    let Tw = T[2];
+
+    let n0 = cross(Tv, Tw);  // coef of px
+    let n1 = cross(Tw, Tu);  // coef of py
+    let n2 = cross(Tu, Tv);  // constant
+
+    let A_ = n0.x*n0.x + n0.y*n0.y - k_sq * n0.z*n0.z;
+    let B_ = n0.x*n1.x + n0.y*n1.y - k_sq * n0.z*n1.z;
+    let E_ = n1.x*n1.x + n1.y*n1.y - k_sq * n1.z*n1.z;
+    let D_ = n0.x*n2.x + n0.y*n2.y - k_sq * n0.z*n2.z;
+    let F_ = n1.x*n2.x + n1.y*n2.y - k_sq * n1.z*n2.z;
+
+    let det = A_*E_ - B_*B_;
+    if !(det > 0.0) || !(A_ > 0.0) || !(E_ > 0.0) {
+        return vec4<f32>(0.0, 0.0, -1.0, -1.0);
+    }
+
+    let p_x = (B_*F_ - E_*D_) / det;
+    let p_y = (B_*D_ - A_*F_) / det;
+
+    // t = -Q(p). Direct (D·p+F·p+G) form loses ~7 digits; evaluate Q via the
+    // cross-product form (each component O(1) after gradient cancellation).
+    let cx_p = p_x*n0.x + p_y*n1.x + n2.x;
+    let cy_p = p_x*n0.y + p_y*n1.y + n2.y;
+    let cz_p = p_x*n0.z + p_y*n1.z + n2.z;
+    let t_   = -(cx_p*cx_p + cy_p*cy_p - k_sq * cz_p*cz_p);
+    if !(t_ > 0.0) {
+        return vec4<f32>(0.0, 0.0, -1.0, -1.0);
+    }
+
+    // Axis-aligned bbox half-extents of the centered ellipse:
+    //   max px-displacement subject to A·dx² + 2B·dx·dy + E·dy² ≤ t
+    //   ⇒ dx_max² = t·E / det,  dy_max² = t·A / det.
+    let hx = sqrt(t_ * E_ / det);
+    let hy = sqrt(t_ * A_ / det);
+    return vec4<f32>(p_x, p_y, hx, hy);
+}
+
 @compute @workgroup_size(256,1,1)
 fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) wgs: vec3<u32>) {
     let idx = gid.x;
@@ -287,38 +352,20 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
         vec3<f32>(dot(I0, np2), dot(I1, np2), dot(I2, np2)),
     );
 
-    // Match CUDA bake_render's default aabb_mode=3: opacity-adaptive cutoff.
-    // For BetaScaled (k=3), the compact support still clips at rho3d=9 in the
-    // fragment; this cutoff only controls bbox/low-pass center calculation.
+    // Beta kernels have COMPACT SUPPORT — `(1 − ρ3d/k²)^shape` is exactly
+    // zero for ρ3d > k². So the bbox doesn't need any 4σ slack: just the
+    // projection of the disk at the kernel's hard edge. The rho2d
+    // antialiasing tail (Gaussian floor) extends past the disk in pixel
+    // space, but its contribution at the disk edge is already low enough
+    // that ignoring it for bbox purposes is "close enough" — no AdR pad.
+    //
+    // Pure-Gaussian kernel (kernel_type 0) has no compact support; it
+    // still needs the AdR log-opacity formula.
     var cutoff: f32;
     if render_settings.kernel_type == 4u {
-        let k = 3.0;
-        let ratio = 1.0 / (255.0 * opacity);
-        var r_beta = 0.0;
-        let threshold = pow(ratio, 1.0 / max(shape, 1e-20));
-        if threshold < 1.0 {
-            r_beta = k * sqrt(1.0 - threshold);
-        }
-        var r_lp = 0.0;
-        let log_term = log(255.0 * opacity);
-        if log_term > 0.0 {
-            r_lp = sqrt(2.0 * log_term);
-        }
-        cutoff = min(max(r_beta, r_lp), k + 2.0);
+        cutoff = 3.0;  // BetaScaled: hard support at ρ3d ≤ 9
     } else if render_settings.kernel_type == 1u {
-        let k = 1.0;
-        let ratio = 1.0 / (255.0 * opacity);
-        var r_beta = 0.0;
-        let threshold = pow(ratio, 1.0 / max(shape, 1e-20));
-        if threshold < 1.0 {
-            r_beta = k * sqrt(1.0 - threshold);
-        }
-        var r_lp = 0.0;
-        let log_term = log(255.0 * opacity);
-        if log_term > 0.0 {
-            r_lp = sqrt(2.0 * log_term);
-        }
-        cutoff = min(max(r_beta, r_lp), k + 2.0);
+        cutoff = 1.0;  // Beta: hard support at ρ3d ≤ 1
     } else {
         let log_term = log(255.0 * opacity);
         if log_term > 0.0 {
@@ -329,7 +376,20 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
         cutoff = min(cutoff, 4.0);
     }
 
-    let aabb = compute_aabb(T_mat, cutoff);
+    // SnugBox path: derive bbox from the conic Q(px,py)=0 instead of the
+    // direct compute_aabb. Mathematically equivalent for non-degenerate
+    // splats; numerically uses cross-product coefficients so it can produce
+    // slightly different (often more stable) extents at edge-on tilts.
+    // Falls back to compute_aabb if the conic returned degenerate.
+    var aabb: vec4<f32>;
+    if render_settings.snugbox_hw == 1u {
+        aabb = compute_aabb_snugbox(T_mat, cutoff);
+        if aabb.z < 0.0 {
+            aabb = compute_aabb(T_mat, cutoff);
+        }
+    } else {
+        aabb = compute_aabb(T_mat, cutoff);
+    }
     let center_pix = aabb.xy;
     let extent_pix = aabb.zw;
     if extent_pix.x < 0.0 {

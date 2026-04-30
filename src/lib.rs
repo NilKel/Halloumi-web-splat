@@ -561,12 +561,16 @@ impl WindowContext {
             // previous frame are still valid and the render pass below
             // re-uses them.
             //
-            // Update atlas toggle before rendering (queue.write_buffer ops
-            // are independent of the encoder).
+            // Update atlas toggle before rendering. Dirty-track: skip the
+            // queue.write_buffer if `atlas_width` is already current.
+            // (`renderer.preprocess` further down will sync `tex_params`
+            // again only if it has dirty viewport / tight_beta_bbox fields.)
             if let Some(ref mut tp) = self.renderer.tex_params {
                 let w = if self.atlas_enabled { self.pc.atlas_width() } else { 0 };
-                tp.as_mut().atlas_width = w;
-                tp.sync(&self.wgpu_context.queue);
+                if tp.as_mut().atlas_width != w {
+                    tp.as_mut().atlas_width = w;
+                    tp.sync(&self.wgpu_context.queue);
+                }
             }
             if let Some(ref mut tr) = self.tile_raster {
                 tr.set_atlas_enabled(self.atlas_enabled, self.pc.atlas_width());

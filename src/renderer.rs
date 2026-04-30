@@ -436,12 +436,23 @@ impl GaussianRenderer {
         // rho2d for `alpha_lp = exp(-rho2d/2)` (CUDA's screen-space low-pass).
         // Also propagate the tight_beta_bbox toggle so the HW vertex shader
         // picks the matching filter_r margin (3.0/1.0 vs 4.0).
+        // Dirty-track: skip the queue.write_buffer when no field changed.
+        // Active panning never resizes the window or toggles the bbox flag,
+        // so this saves one CPU-side queue write per active frame.
         if let Some(tp) = self.tex_params.as_mut() {
+            let new_w = viewport.x;
+            let new_h = viewport.y;
+            let new_tight = render_settings.tight_beta_bbox as u32;
             let v = tp.as_mut();
-            v.viewport_w = viewport.x;
-            v.viewport_h = viewport.y;
-            v.tight_beta_bbox = render_settings.tight_beta_bbox as u32;
-            tp.sync(queue);
+            if v.viewport_w != new_w
+                || v.viewport_h != new_h
+                || v.tight_beta_bbox != new_tight
+            {
+                v.viewport_w = new_w;
+                v.viewport_h = new_h;
+                v.tight_beta_bbox = new_tight;
+                tp.sync(queue);
+            }
         }
 
         let depth_buffer = &self.sorter_suff.as_ref().unwrap().sorter_bg_pre;
@@ -548,7 +559,7 @@ impl GaussianRenderer {
         GPURSSorter::record_reset_indirect_buffer(
             &self.sorter_suff.as_ref().unwrap().sorter_dis,
             &self.sorter_suff.as_ref().unwrap().sorter_uni,
-            &queue,
+            encoder,
         );
 
         if let Some(stopwatch) = stopwatch {

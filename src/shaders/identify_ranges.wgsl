@@ -1,5 +1,6 @@
 // Identify tile ranges: scan sorted tile keys to find per-tile start/end indices.
-// After radix sort, tile_keys is sorted by (tile_id << 16 | depth).
+// After radix sort, tile_keys is sorted by (tile_id << 16 | depth_quant_10 << 6 | idx_lsb_6).
+// tile_id is the upper 16 bits.
 // This shader finds where each tile_id starts and ends in the sorted array.
 //
 // Uses two separate array<u32> buffers (tile_starts, tile_ends) instead of

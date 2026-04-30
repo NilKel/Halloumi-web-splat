@@ -90,7 +90,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let rect_max_x = rect.z;
     let rect_max_y = rect.w;
 
-    let d16 = depth_vals[idx] & 0xFFFFu; // ensure 16-bit
+    // depth_vals layout (set in preprocess_tile_2dgs.wgsl):
+    //   bits  0..15: depth_quant_16 (normalized z * 65535)
+    //   bits 16..31: idx_lsb_16     (low 16 bits of original splat_idx)
+    // We pack into the 32-bit sort key as (tile_16, depth_10, idx_lsb_6).
+    // 1024 depth buckets across [0, zfar] = ~0.05 unit precision at zfar=50,
+    // fine enough for almost all overlapping splats to land in distinct buckets.
+    // The 6-bit idx_lsb tiebreaker is deterministic when (tile, depth) ties.
+    let dval = depth_vals[idx];
+    let depth_quant_10 = (dval >> 6u) & 0x3FFu;
+    let idx_lsb_6      = (dval >> 16u) & 0x3Fu;
 
     // Get write offset from prefix sum (inclusive → exclusive by subtracting original count)
     var write_offset: u32;
@@ -178,7 +187,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let off = write_offset + j;
             if (tx >= tx_lo) && (tx < tx_hi) {
                 let tile_id = ty * info.tiles_x + tx;
-                tile_keys[off] = (tile_id << 16u) | d16;
+                // 32-bit packed key: (tile_16 << 16) | (depth_10 << 6) | idx_lsb_6.
+                // tile_id primary, depth secondary, splat_idx_lsb is the
+                // deterministic tiebreak (eliminates flicker from atomicAdd
+                // store_idx ordering).
+                tile_keys[off] = (tile_id << 16u) | (depth_quant_10 << 6u) | idx_lsb_6;
                 tile_payloads[off] = idx;
             } else {
                 tile_keys[off] = SENTINEL;

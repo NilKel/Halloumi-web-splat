@@ -515,7 +515,6 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>) {
         0u,
     );
 
-    // Depth for sorting
     let zfar = -camera.proj[3][2] / (camera.proj[2][2] - 1.0);
     sort_depths[store_idx] = bitcast<u32>(zfar - pos2d.z);
     sort_indices[store_idx] = store_idx;
@@ -529,9 +528,14 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>) {
     tiles_touched[store_idx] = n_tiles;
     rect_data[store_idx] = vec4<u32>(rect_min_x, rect_min_y, rect_max_x, rect_max_y);
 
-    // Quantize depth to 16 bits for packed tile|depth key
+    // Pack 16-bit normalized depth in low half + 16-bit splat_idx_lsb in high
+    // half. duplicate_keys uses both to build the (tile, depth_10, idx_lsb_6)
+    // key — the idx_lsb provides a DETERMINISTIC tiebreak when (tile, depth)
+    // ties, eliminating flicker from non-deterministic atomicAdd store_idx.
     let depth_norm = clamp(pos2d.z / zfar, 0.0, 1.0);
-    depth_16[store_idx] = u32(depth_norm * 65535.0);
+    let depth_16_only = u32(depth_norm * 65535.0);
+    let idx_lsb_16 = idx & 0xFFFFu;
+    depth_16[store_idx] = (idx_lsb_16 << 16u) | depth_16_only;
 
     // AccuTile per-Gaussian conic: ellipse in pixel coords for the same
     // cutoff used by compute_aabb above. duplicate_keys reads this and

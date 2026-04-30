@@ -39,7 +39,7 @@ struct Opt {
     compute_raster: bool,
 
     /// Tile size for the compute path (8/16/32). Ignored under HW raster.
-    #[arg(long, default_value_t = 16)]
+    #[arg(long, default_value_t = 8)]
     tile_size: u32,
 
     /// AABB mode for the compute path: 0=Square, 2=Rect, 3=Rect+AdR.

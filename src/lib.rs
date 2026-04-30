@@ -374,7 +374,7 @@ impl WindowContext {
             kernel_type_override,
             use_shared_mem: true,
             aabb_mode: 3, // default to Rect+AdR (tightest bounding)
-            tile_size: 16,
+            tile_size: 8,
         })
     }
 
@@ -545,6 +545,12 @@ impl WindowContext {
             // tile_raster.output_buf is reused by the fullscreen-copy pass.
             if redraw_scene {
                 if let Some(ref mut tr) = self.tile_raster {
+                    // Push atlas-toggle state into tile_raster's tex_params
+                    // BEFORE prepare runs (prepare's `tex_params.sync(queue)`
+                    // inside picks it up). Was previously only done in the
+                    // HW branch — that's why toggling A in compute mode did
+                    // nothing until you switched paths.
+                    tr.set_atlas_enabled(self.atlas_enabled, self.pc.atlas_width());
                     tr.prepare(
                         &mut encoder,
                         &self.wgpu_context.queue,

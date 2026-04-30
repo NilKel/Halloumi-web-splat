@@ -74,7 +74,7 @@ struct ViewportInfoUniform {
     height: u32,
 }
 
-const DEFAULT_TILE_SIZE: u32 = 16;
+const DEFAULT_TILE_SIZE: u32 = 8;
 const MAX_TILES_PER_GAUSSIAN: u32 = 16;
 
 pub struct TileRasterPipeline {

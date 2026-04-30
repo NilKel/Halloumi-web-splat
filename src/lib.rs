@@ -555,13 +555,16 @@ impl WindowContext {
                     tr.set_atlas_enabled(self.atlas_enabled, self.pc.atlas_width());
                 }
 
+                // Wire the stopwatch through so renderer.prepare records
+                // "preprocess" and "sorting" timestamps. None on macOS/iOS
+                // (TIMESTAMP_QUERY unavailable), where ui.rs reads zeros.
                 self.renderer.prepare(
                     &mut compute_encoder,
                     &self.wgpu_context.device,
                     &self.wgpu_context.queue,
                     &self.pc,
                     self.splatting_args,
-                    &mut None,
+                    &mut self.stopwatch,
                 );
 
                 self.wgpu_context.queue.submit([compute_encoder.finish()]);
@@ -610,21 +613,32 @@ impl WindowContext {
                 tr.render(&mut render_pass);
             }
         } else {
-            // Hardware raster
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("render pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view_rgb,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(self.splatting_args.background_color),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                ..Default::default()
-            });
-            self.renderer.render(&mut render_pass, &self.pc);
+            // Hardware raster — wrap the draw in a "rasterization"
+            // start/stop so the Render Stats panel can graph it alongside
+            // preprocess and sorting (recorded inside renderer.prepare).
+            // No-op on macOS/iOS (stopwatch = None).
+            if let Some(sw) = &mut self.stopwatch {
+                let _ = sw.start(&mut encoder, "rasterization");
+            }
+            {
+                let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("render pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view_rgb,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(self.splatting_args.background_color),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    ..Default::default()
+                });
+                self.renderer.render(&mut render_pass, &self.pc);
+            }
+            if let Some(sw) = &mut self.stopwatch {
+                let _ = sw.stop(&mut encoder, "rasterization");
+            }
         }
 
         if let Some(state) = &ui_state {
@@ -648,6 +662,15 @@ impl WindowContext {
 
         if let Some(ui_state) = ui_state {
             self.ui_renderer.cleanup(ui_state)
+        }
+
+        // Resolve all timestamp queries (preprocess/sorting written into the
+        // compute encoder, rasterization written into this encoder). One
+        // resolve at the end of the frame is enough — the GPU executes all
+        // submitted encoders in order, so all writes complete before this
+        // resolve runs. ui.rs::ui then drains via take_measurements next frame.
+        if let Some(sw) = &mut self.stopwatch {
+            sw.end(&mut encoder);
         }
 
         self.wgpu_context.queue.submit([encoder.finish()]);
